@@ -1,0 +1,1340 @@
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\DependencyInjectionExtensions.cs
+
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Youxel.UnitOfWork.Context;
+
+namespace Youxel.UnitOfWork
+{
+    public static class DependecyInjectionExtensions
+    {
+        public static IServiceCollection AddDbContext<TContext>(this IServiceCollection services, string connectionString) where TContext : ContextBase
+        {
+            services.AddDbContextPool<TContext>(o => o.UseSqlServer(connectionString));
+            return services;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\IUnitOfWork.cs
+
+using MediatR;
+using Microsoft.EntityFrameworkCore.Storage;
+using Microsoft.EntityFrameworkCore;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Youxel.UnitOfWork
+{
+    /// <summary>
+    /// Contract for Unit of work functionality
+    /// </summary>
+    public interface IUnitOfWork
+    {
+        /// <summary>
+        /// Gets the current running transaction instance
+        /// </summary>
+        public IDbContextTransaction? GetCurrentTransaction();
+
+        /// <summary>
+        /// Begin a new transaction
+        /// </summary>
+        /// <returns>the created transaction</returns>
+        public Task<IDbContextTransaction> BeginTransactionAsync();
+
+        /// <summary>
+        /// Commit a single transaction
+        /// </summary>
+        /// <param name="transaction">transaction to be committed</param>
+        public Task CommitTransactionAsync(IDbContextTransaction transaction);
+
+        /// <summary>
+        /// roll back the current active transaction
+        /// </summary>
+        public void RollbackTransaction();
+
+
+        public void Commit();
+        public Task CommitAsync();
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Audit\Auditor.cs
+
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.ChangeTracking;
+using Youxel.UnitOfWork.Context;
+
+namespace Youxel.Audit
+{
+    /// <summary>
+    /// class to perform audit trail upon transaction saving.
+    /// </summary>
+    public class Auditor : IPreTransactionDependency
+    {
+        private readonly IAuditUserInformation _auditUserInformation;
+
+
+        public Auditor(IAuditUserInformation auditUserInformation)
+        {
+            _auditUserInformation = auditUserInformation;
+        }
+
+        /// <summary>
+        /// event handling for database transaction
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        public void Context_SavingChanges(DbContext context)
+        {
+            // getting audited models
+            var trackedEntities = context.ChangeTracker.Entries<IAuditedModel>().Where(x => x.State is EntityState.Added or EntityState.Modified).ToList();
+
+            // check if any models to be audited
+            if (trackedEntities.Count == 0)
+                return;
+
+            // audit changes.
+            AuditChanges(trackedEntities);
+        }
+
+        /// <summary>
+        /// audit changes on specific tracked entities
+        /// </summary>
+        /// <param name="trackedEntities">entities to be audited</param>
+        private void AuditChanges(List<EntityEntry<IAuditedModel>> trackedEntities)
+        {
+            // loop on tracked entities
+            foreach (var entry in trackedEntities)
+            {
+                // set audit information
+                switch (entry.State)
+                {
+                    case EntityState.Added:
+                        entry.Entity.CreatedById = _auditUserInformation.Identifier;
+                        entry.Entity.CreatedAt = DateTimeOffset.Now;
+                        break;
+                    case EntityState.Modified:
+                        entry.Entity.LastModifiedById = _auditUserInformation.Identifier;
+                        entry.Entity.LastModifiedAt = DateTimeOffset.Now;
+                        break;
+                }
+            }
+
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Audit\DependecyInjectionExtensions.cs
+
+using Microsoft.Extensions.DependencyInjection;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Youxel.Audit
+{
+    public static class DependecyInjectionExtensions
+    {
+        public static IServiceCollection AddEntityAuditor(this IServiceCollection services)
+        {
+            services.AddScoped<Auditor>();
+            return services;
+        }
+    }
+}
+
+
+
+// entity framework queries
+// sample how to use.
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Audit\IAuditedModel.cs
+
+namespace Youxel.Audit
+{
+    /// <summary>
+    /// Contract to unify the audit data inside a certain entity
+    /// </summary>
+    public interface IAuditedModel
+    {
+        /// <summary>
+        /// audit creator user id
+        /// </summary>
+        public string CreatedById { get; set; }
+        /// <summary>
+        /// creation datetime offset
+        /// </summary>
+        public DateTimeOffset CreatedAt { get; set; }
+
+        /// <summary>
+        /// modifier user identifier
+        /// </summary>
+        public string LastModifiedById { get; set; }
+        /// <summary>
+        /// modifying datetime offset
+        /// </summary>
+        public DateTimeOffset? LastModifiedAt { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Audit\IAuditUserInformation.cs
+
+namespace Youxel.Audit
+{
+    /// <summary>
+    /// Contract to represent user information required for auditing
+    /// </summary>
+    public interface IAuditUserInformation
+    {
+        /// <summary>
+        /// user identifier
+        /// </summary>
+        public string Identifier { get; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Context\ContextBase.cs
+
+using MediatR;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
+
+namespace Youxel.UnitOfWork.Context
+{
+    public class ContextBase : DbContext, IUnitOfWork
+    {
+
+        protected readonly IMediator _mediator;
+        protected IDbContextTransaction? _currentTransaction;
+
+        public IDbContextTransaction? GetCurrentTransaction() => _currentTransaction;
+        public bool HasActiveTransaction => _currentTransaction is not null;
+
+        public ContextBase(DbContextOptions options, IMediator mediator, IEnumerable<IPreTransactionDependency> preTransactionDependency, IEnumerable<IPostTransactionDependency> postTransactionDependency) : base(options)
+        {
+            _mediator = mediator ?? throw new ArgumentNullException(nameof(mediator));
+
+            if (preTransactionDependency?.Count() > 0)
+                foreach (var dependency in preTransactionDependency)
+                    SavingChanges += (s, a) => dependency.Context_SavingChanges(this);
+
+            if (postTransactionDependency?.Count() > 0)
+                foreach (var dependency in postTransactionDependency)
+                    SavedChanges += (s, a) => dependency.Context_SavedChanges(this);
+        }
+
+        public async Task<IDbContextTransaction> BeginTransactionAsync()
+        {
+            if (_currentTransaction is not null) return null;
+
+            _currentTransaction = await Database.BeginTransactionAsync();
+
+            return _currentTransaction;
+        }
+
+        public async Task CommitTransactionAsync(IDbContextTransaction transaction)
+        {
+            if (transaction == null) throw new ArgumentNullException(nameof(transaction));
+            if (transaction != _currentTransaction) throw new InvalidOperationException($"Transaction {transaction.TransactionId} is not current");
+
+            try
+            {
+                await SaveChangesAsync();
+                await transaction.CommitAsync();
+            }
+            catch
+            {
+                RollbackTransaction();
+                throw;
+            }
+            finally
+            {
+                if (_currentTransaction != null)
+                {
+                    _currentTransaction.Dispose();
+                    _currentTransaction = null;
+                }
+            }
+        }
+
+        public void RollbackTransaction()
+        {
+            try
+            {
+                _currentTransaction?.Rollback();
+            }
+            finally
+            {
+                if (_currentTransaction is not null)
+                {
+                    _currentTransaction.Dispose();
+                    _currentTransaction = null;
+                }
+            }
+        }
+
+        public void Commit()
+            => SaveChanges();
+        public async Task CommitAsync()
+            => await SaveChangesAsync();
+    }
+}
+
+
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Context\IPostTransactionDependency.cs
+
+using Microsoft.EntityFrameworkCore;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Youxel.UnitOfWork.Context
+{
+    /// <summary>
+    /// unified interface to provide extendability of injecting logic after transaction handling
+    /// </summary>
+    public interface IPostTransactionDependency
+    {
+        /// <summary>
+        /// delegate that contains the extended functionality
+        /// </summary>
+        /// <param name="context"></param>
+        public void Context_SavedChanges(DbContext context);
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Context\IPreTransactionDependency.cs
+
+using Microsoft.EntityFrameworkCore;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Youxel.UnitOfWork.Context
+{
+    /// <summary>
+    /// unified interface to provide extendability of injecting logic before transaction handling
+    /// </summary>
+    public interface IPreTransactionDependency
+    {
+        /// <summary>
+        /// delegate that contains the extended functionality
+        /// </summary>
+        /// <param name="context"></param>
+        public void Context_SavingChanges(DbContext context);
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Domain\Aggregate\IAggregateRoot.cs
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Youxel.Domain.Events;
+
+namespace Youxel.Domain.Aggregate
+{
+    /// <summary>
+    /// contract to unify DDD aggregate root
+    /// </summary>
+    public interface IAggregateRoot
+    {
+        public Guid Id { get; set; }
+        /// <summary>
+        /// queue of domain events
+        /// </summary>
+        public ConcurrentQueue<IDomainEvent> DomainEvents { get; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Domain\Events\IDomainEvent.cs
+
+using MediatR;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Youxel.Domain.Events
+{
+    /// <summary>
+    /// unified contract for domain event communication
+    /// </summary>
+    public interface IDomainEvent : INotification
+    {
+        /// <summary>
+        /// When the event occured
+        /// </summary>
+        public DateTimeOffset Occured { get; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Domain\Events\IIntegrationEvent.cs
+
+using MediatR;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Youxel.Domain.Events
+{
+    /// <summary>
+    /// unified contract for integration event for microservices communication
+    /// </summary>
+    public interface IIntegrationEvent<T>
+    {
+        /// <summary>
+        /// When the event occured
+        /// </summary>
+        public DateTimeOffset Occured { get; }
+        /// <summary>
+        /// Event Unique Identitifer ex: Guid of an entity publishing the event
+        /// </summary>
+        public string Identifier { get; }
+        /// <summary>
+        /// Event Topic identifier ex: Request_State_Changed
+        /// </summary>
+        public string Topic { get; }
+        /// <summary>
+        /// Event version for background competability 
+        /// </summary>
+        public int Version { get; }
+        /// <summary>
+        /// Event Payload contains a readonly event data.
+        /// </summary>
+        public T Payload { get; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Domain\Events\MediatorEventDispatcher.cs
+
+using MediatR;
+using Microsoft.EntityFrameworkCore;
+using Youxel.Domain.Aggregate;
+using Youxel.UnitOfWork.Context;
+
+namespace Youxel.Domain.Events
+{
+    /// <summary>
+    /// Domain event dispatcher class relying on db context 
+    /// Dispatcher listening on Db Context Saving Changes event
+    /// Dispatcher takes the responsibility of firing domain events withing the domain transaction
+    /// </summary>
+    public class MediatorEventDispatcher : IPreTransactionDependency
+    {
+        private readonly IMediator _mediator;
+
+        public MediatorEventDispatcher(IMediator mediator)
+        {
+            _mediator = mediator;
+        }
+        /// <summary>
+        /// event handler for db context event
+        /// </summary>
+        /// <param name="sender">the database context</param>
+        /// <param name="e">the saving changes arguments</param>
+        public void Context_SavingChanges(DbContext context)
+        {
+            // fetch domain events
+            var aggregates = context.ChangeTracker.Entries<IAggregateRoot>().Where(x => x.Entity.DomainEvents is not null && !x.Entity.DomainEvents.IsEmpty).Select(e => e.Entity).ToList();
+            if (aggregates.Count == 0)
+                return;
+
+            // fire domain events
+            Task.Run(async () => await DispatchDomainEventsAsync(aggregates)).Wait(); // Blocking call 
+        }
+
+        /// <summary>
+        /// Dispatching method for domain events
+        /// </summary>
+        /// <param name="aggregateRoots">list of aggregate roots that has queued events</param>
+        public async Task DispatchDomainEventsAsync(List<IAggregateRoot> aggregateRoots)
+        {
+            // looping on aggregate roots
+            foreach (var aggregate in aggregateRoots)
+            {
+                // dequeuing events
+                while (aggregate.DomainEvents.TryDequeue(out var domainEvent))
+                {
+                    // dispatching event.
+                    await _mediator.Publish(domainEvent);
+                }
+            }
+        }
+
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Domain\Exceptions\BusinessException.cs
+
+using System.Net;
+
+namespace Youxel.UnitOfWork.Domain.Exceptions
+{
+    public class BusinessException : Exception
+    {
+        public HttpStatusCode StatusCode { get; }
+        public string ArabicMessage { get; }
+        public string EnglishMessage { get; }
+        public string ErrorCode { get; }
+
+        public BusinessException(string errorCode, HttpStatusCode code = HttpStatusCode.BadRequest)
+        {
+            StatusCode = code;
+            ErrorCode = errorCode;
+            // TODO : provide a way to inject messages.
+            //ArabicMessage = arabicMessage;
+            //EnglishMessage = englishMessage;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Domain\ValueObjects\ValueObject.cs
+
+using System.Collections.Generic;
+using System.Linq;
+
+namespace Youxel.Domain.ValueObjects
+{
+    // Learn more: https://docs.microsoft.com/en-us/dotnet/standard/microservices-architecture/microservice-ddd-cqrs-patterns/implement-value-objects
+    public abstract class ValueObject
+    {
+        protected static bool EqualOperator(ValueObject left, ValueObject right)
+        {
+            if (left is null ^ right is null)
+            {
+                return false;
+            }
+
+            return left?.Equals(right) != false;
+        }
+
+        protected static bool NotEqualOperator(ValueObject left, ValueObject right)
+        {
+            return !EqualOperator(left, right);
+        }
+
+        protected abstract IEnumerable<object> GetAtomicValues();
+
+        public override bool Equals(object obj)
+        {
+            if (obj == null || obj.GetType() != GetType())
+            {
+                return false;
+            }
+
+            var other = (ValueObject)obj;
+            var thisValues = GetAtomicValues().GetEnumerator();
+            var otherValues = other.GetAtomicValues().GetEnumerator();
+
+            while (thisValues.MoveNext() && otherValues.MoveNext())
+            {
+                if (thisValues.Current is null ^ otherValues.Current is null)
+                {
+                    return false;
+                }
+
+                if (thisValues.Current != null &&
+                    !thisValues.Current.Equals(otherValues.Current))
+                {
+                    return false;
+                }
+            }
+
+            return !thisValues.MoveNext() && !otherValues.MoveNext();
+        }
+
+        public override int GetHashCode()
+        {
+            return GetAtomicValues()
+                .Select(x => x != null ? x.GetHashCode() : 0)
+                .Aggregate((x, y) => x ^ y);
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Enums\SortDirection.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Youxel.UnitOfWork.Enums
+{
+    public enum SortDirection
+    {
+        Ascending,
+        Descending,
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Examples\QueriesExample.cs
+
+using MediatR;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Youxel.UnitOfWork.Enums;
+using Youxel.UnitOfWork.Examples.Entities;
+using Youxel.UnitOfWork.Repositories;
+
+namespace Youxel.UnitOfWork.Examples
+{
+    public class QueriesExample
+    {
+
+        public class GetUserRequestsQuery : IRequest<PagedResult<RequestReadModel>>
+        {
+            public int PageSize { get; set; }
+            public int PageIndex { get; set; }
+            public string UserEmail { get; set; }
+            public class Handler : IRequestHandler<GetUserRequestsQuery, PagedResult<RequestReadModel>>
+            {
+                public Handler(IReadRepository<Request> readRepository)
+                {
+                    ReadRepository = readRepository;
+                }
+
+                public IReadRepository<Request> ReadRepository { get; }
+
+                public async Task<PagedResult<RequestReadModel>> Handle(GetUserRequestsQuery query, CancellationToken cancellationToken)
+                {
+                    var (querable, count) = await ReadRepository.AsQueryable().QueryProjectionOrderedPagedAsync(predicate: e => e.RequestOwner == query.UserEmail,
+                                                    projectionExpression: e => new RequestReadModel { Id = e.Id, RequestOwner = e.RequestOwner },
+                                                    orderExpression: e => e.DueDate,
+                                                    sortDirection: SortDirection.Descending,
+                                                    pageSize: query.PageSize,
+                                                    pageIndex: query.PageIndex);
+
+                    var records = await querable.Meterialize();
+
+                    return new PagedResult<RequestReadModel>
+                    {
+                        PageIndex = query.PageIndex,
+                        PageSize = query.PageSize,
+                        TotalCount = count,
+                        Records = records
+                    };
+                }
+            }
+        }
+
+
+        // Request Read Model 
+
+
+        public class PagedResult<T>
+        {
+            public int PageIndex { get; set; }
+            public int PageSize { get; set; }
+            public int TotalCount { get; set; }
+            public List<T> Records { get; set; }
+        }
+
+        public class RequestReadModel
+        {
+            public Guid Id { get; set; }
+            public string RequestOwner { get; set; }
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Examples\UnitOfWorkExample.cs
+
+using MediatR;
+using Youxel.UnitOfWork.Examples.Entities;
+using Youxel.UnitOfWork.Examples.IntegrationEvents;
+using Youxel.UnitOfWork.Repositories;
+using static Youxel.UnitOfWork.Examples.UnitOfWorkExample.AssignRequestCommand;
+
+namespace Youxel.UnitOfWork.Examples
+{
+    public class UnitOfWorkExample
+    {
+        // request
+        public class AssignRequestCommand : IRequest<AssignRequestResult>
+        {
+            public Guid RequestId { get; set; }
+            public string AssigneeEmail { get; set; }
+            public string AssigneeName { get; set; }
+            public class Handler : IRequestHandler<AssignRequestCommand, AssignRequestResult>
+            {
+                public Handler(IWriteRepository<Request> requestRepository)
+                {
+                    RequestRepository = requestRepository;
+                }
+
+                public IWriteRepository<Request> RequestRepository { get; }
+
+                public async Task<AssignRequestResult> Handle(AssignRequestCommand command, CancellationToken cancellationToken)
+                {
+                    var request = await RequestRepository.FindAsync(command.RequestId);
+
+                    request.Assign(new ValueObjects.RequestAssignment(command.AssigneeName, command.AssigneeEmail));
+
+                    RequestRepository.Update(request);
+
+                    await RequestRepository.UnitOfWork.CommitAsync();
+
+                    var integrationEvent = new RequestAssignedIntegrationEvent(request.Id, new RequestAssignedIntegrationEvent.Data(request.Assignee.Email));
+                    // fire integration event;
+
+                    return new AssignRequestResult { Success = true };
+                }
+            }
+
+            public class AssignRequestResult
+            {
+                public bool Success { get; set; }
+            }
+        }
+
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Examples\Aggregates\Request.cs
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Youxel.Domain.Aggregate;
+using Youxel.Domain.Events;
+using Youxel.Domain.ValueObjects;
+using Youxel.UnitOfWork.Examples.DomainEvents;
+using Youxel.UnitOfWork.Examples.Exceptions;
+using Youxel.UnitOfWork.Examples.ValueObjects;
+
+namespace Youxel.UnitOfWork.Examples.Entities
+{
+    public class Request : IAggregateRoot
+    {
+        public Guid Id { get; set; }
+        public DateTimeOffset DueDate { get; set; }
+
+        public string RequestOwner { get; set; }
+        public RequestAssignment Assignee { get; set; }
+        public Request(Guid id, DateTimeOffset dueDate)
+        {
+            Id = id;
+            DueDate = dueDate;
+            DomainEvents = new ConcurrentQueue<IDomainEvent>();
+        }
+
+        public void ChangeAcceptability()
+        {
+
+        }
+
+        public void Assign(RequestAssignment assignee)
+        {
+            if (assignee.Email == RequestOwner)
+                throw new InvalidRequestAssignmentException();
+
+            Assignee = assignee;
+
+            DomainEvents.Enqueue(new RequestAssignedEvent(Id, Assignee));
+        }
+
+        public ConcurrentQueue<IDomainEvent> DomainEvents { get; }
+    }
+
+
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Examples\DomainEvents\RequestAssignedEvent.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Youxel.Domain.Events;
+using Youxel.UnitOfWork.Examples.ValueObjects;
+
+namespace Youxel.UnitOfWork.Examples.DomainEvents
+{
+    public class RequestAssignedEvent : IDomainEvent
+    {
+        public DateTimeOffset Occured { get; }
+        public Guid RequestId { get; }
+        public RequestAssignment Assignee { get;  }
+        public RequestAssignedEvent(Guid requestId, RequestAssignment assginee)
+        {
+            Occured = DateTimeOffset.Now;
+            RequestId = requestId;
+            Assignee = assginee;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Examples\Exceptions\InvalidRequestAssignmentException.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Text;
+using System.Threading.Tasks;
+using Youxel.UnitOfWork.Domain.Exceptions;
+
+namespace Youxel.UnitOfWork.Examples.Exceptions
+{
+    public class InvalidRequestAssignmentException : BusinessException
+    {
+        public InvalidRequestAssignmentException() : base("ERROR_001", HttpStatusCode.BadRequest)
+        {
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Examples\IntegrationEvents\RequestAssignedIntegrationEvent.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Youxel.Domain.Events;
+
+namespace Youxel.UnitOfWork.Examples.IntegrationEvents
+{
+    public class RequestAssignedIntegrationEvent : IIntegrationEvent<RequestAssignedIntegrationEvent.Data>
+    {
+        public DateTimeOffset Occured { get; }
+
+        public string Identifier { get; }
+
+        public string Topic => "REQUEST_ASSIGNED";
+
+        public int Version => 1;
+
+        public Data Payload { get; }
+
+        public class Data
+        {
+            public Data(string assgineeEmail)
+            {
+                AssigneeEmail = assgineeEmail;
+            }
+
+            public string AssigneeEmail { get; }
+        }
+
+        public RequestAssignedIntegrationEvent(Guid RequestId, RequestAssignedIntegrationEvent.Data payload)
+        {
+            Occured = DateTimeOffset.Now;
+            Identifier = RequestId.ToString();
+            Payload = payload;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Examples\ValueObjects\RequestAssignment.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Youxel.Domain.ValueObjects;
+
+namespace Youxel.UnitOfWork.Examples.ValueObjects
+{
+    public class RequestAssignment : ValueObject
+    {
+        public RequestAssignment(string name, string email)
+        {
+            Name = name;
+            Email = email;
+        }
+
+        public string Name { get; }
+        public string Email { get; }
+
+        protected override IEnumerable<object> GetAtomicValues()
+        {
+            throw new NotImplementedException();
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Repositories\BaseReadRepository.cs
+
+using Microsoft.EntityFrameworkCore;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Text;
+using System.Threading.Tasks;
+using Youxel.UnitOfWork.Context;
+
+namespace Youxel.UnitOfWork.Repositories
+{
+    /// <summary>
+    /// Abstract class that encapsulates the base read funcionality
+    /// </summary>
+    /// <typeparam name="TEntity"></typeparam>
+    public abstract class BaseReadRepository<TEntity> where TEntity : class, IReadRepository<TEntity>
+    {
+        protected readonly DbSet<TEntity> _set;
+
+
+        protected BaseReadRepository(ContextBase contextBase)
+        {
+            _set = contextBase.Set<TEntity>();
+        }
+
+
+        public IQueryable<TEntity> AsQueryable()
+           => _set.AsNoTracking();
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Repositories\BaseWriteRepository.cs
+
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.ChangeTracking;
+using Microsoft.EntityFrameworkCore.Metadata;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Youxel.UnitOfWork.Context;
+
+namespace Youxel.UnitOfWork.Repositories
+{
+    /// <summary>
+    /// Abstract class that encapsulates the database base write funcionality
+    /// </summary>
+    /// <typeparam name="TEntity"></typeparam>
+    public abstract class BaseWriteRepository<TEntity> : IWriteRepository<TEntity> where TEntity : class
+    {
+        protected readonly DbSet<TEntity> _set;
+
+        protected BaseWriteRepository(ContextBase contextBase, IUnitOfWork unitOfWork)
+        {
+            _set = contextBase.Set<TEntity>();
+            UnitOfWork = unitOfWork;
+        }
+
+        /// <summary>
+        /// Instance Of Unit of work for handling transaction.
+        /// </summary>
+        public IUnitOfWork UnitOfWork { get; }
+
+        public TEntity Add(TEntity entity)
+            => _set.Add(entity).Entity;
+
+        public async Task<TEntity> AddAsync(TEntity entity, CancellationToken cancellationToken = default)
+            => (await _set.AddAsync(entity, cancellationToken)).Entity;
+
+        public void AddRange(params TEntity[] entities)
+            => _set.AddRange(entities);
+
+        public void AddRange(IEnumerable<TEntity> entities)
+            => _set.AddRange(entities);
+
+        public Task AddRangeAsync(params TEntity[] entities)
+            => _set.AddRangeAsync(entities);
+
+        public Task AddRangeAsync(IEnumerable<TEntity> entities, CancellationToken cancellationToken = default)
+            => _set.AddRangeAsync(entities, cancellationToken);
+
+        public IAsyncEnumerable<TEntity> AsAsyncEnumerable()
+            => _set.AsAsyncEnumerable();
+
+        public IQueryable<TEntity> AsQueryable()
+            => _set.AsQueryable();
+
+        public TEntity Attach(TEntity entity)
+            => _set.Attach(entity).Entity;
+
+        public void AttachRange(params TEntity[] entities)
+            => _set.AttachRange(entities);
+
+        public void AttachRange(IEnumerable<TEntity> entities)
+            => _set.AttachRange(entities);
+
+        public TEntity? Find(params object?[]? keyValues)
+            => _set.Find(keyValues);
+
+        public async Task<TEntity?> FindAsync(params object?[]? keyValues)
+            => (await _set.FindAsync(keyValues));
+
+        public async Task<TEntity?> FindAsync(object?[]? keyValues, CancellationToken cancellationToken)
+            => await _set.FindAsync(keyValues, cancellationToken);
+
+        public IAsyncEnumerator<TEntity> GetAsyncEnumerator(CancellationToken cancellationToken = default)
+            => _set.GetAsyncEnumerator(cancellationToken);
+
+        public TEntity Remove(TEntity entity)
+            => _set.Remove(entity).Entity;
+
+        public void RemoveRange(params TEntity[] entities)
+            => _set.RemoveRange(entities);
+
+        public void RemoveRange(IEnumerable<TEntity> entities)
+            => _set.RemoveRange(entities);
+
+        public TEntity Update(TEntity entity)
+            => _set.Update(entity).Entity;
+
+        public void UpdateRange(params TEntity[] entities)
+            => _set.UpdateRange(entities);
+
+        public void UpdateRange(IEnumerable<TEntity> entities)
+            => _set.UpdateRange(entities);
+
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Repositories\IReadRepository.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Youxel.UnitOfWork.Repositories
+{
+    /// <summary>
+    /// contract that encapsulates the all required functionality for reading repository
+    /// </summary>
+    /// <typeparam name="TEntity">entity for the repository</typeparam>
+    public interface IReadRepository<TEntity> where TEntity : class
+    {
+        public IQueryable<TEntity> AsQueryable();
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Repositories\IWriteRepository.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Youxel.UnitOfWork.Repositories
+{
+    /// <summary>
+    /// contract that encapsulates the all required functionality for writing repository
+    /// </summary>
+    /// <typeparam name="TEntity">entity for the repository</typeparam>
+    public interface IWriteRepository<TEntity> where TEntity : class
+    {
+        public IUnitOfWork UnitOfWork { get; }
+
+        public IQueryable<TEntity> AsQueryable();
+
+        public TEntity? Find(params object?[]? keyValues);
+        public Task<TEntity?> FindAsync(params object?[]? keyValues);
+        public Task<TEntity?> FindAsync(object?[]? keyValues, CancellationToken cancellationToken);
+
+
+        public TEntity Attach(TEntity entity);
+        public void AttachRange(params TEntity[] entities);
+        public void AttachRange(IEnumerable<TEntity> entities);
+
+        public Task<TEntity?> AddAsync(TEntity entity, CancellationToken cancellationToken = default);
+        public void AddRange(params TEntity[] entities);
+        public void AddRange(IEnumerable<TEntity> entities);
+        public Task AddRangeAsync(params TEntity[] entities);
+        public Task AddRangeAsync(IEnumerable<TEntity> entities, CancellationToken cancellationToken = default);
+
+        public TEntity Update(TEntity entity);
+        public void UpdateRange(params TEntity[] entities);
+        public void UpdateRange(IEnumerable<TEntity> entities);
+
+        public TEntity Remove(TEntity entity);
+        public void RemoveRange(params TEntity[] entities);
+        public void RemoveRange(IEnumerable<TEntity> entities);
+
+        public IAsyncEnumerator<TEntity> GetAsyncEnumerator(CancellationToken cancellationToken = default);
+        public IAsyncEnumerable<TEntity> AsAsyncEnumerable();
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Files\Youxel.UnitOfWork\Youxel.UnitOfWork\Repositories\QueryExtensions.cs
+
+
+using Microsoft.EntityFrameworkCore;
+using System.Linq.Expressions;
+using Youxel.UnitOfWork.Enums;
+
+namespace Youxel.UnitOfWork.Repositories
+{
+    /// <summary>
+    /// Extension methods encapsulates query mechanisms
+    /// </summary>
+    public static class QueryExtensions
+    {
+        public static IQueryable<TEntity> Query<TEntity>(this IQueryable<TEntity> entities, Expression<Func<TEntity, bool>> predicate) where TEntity : class
+        {
+            if (predicate == null)
+                throw new ArgumentNullException(nameof(predicate));
+
+            return entities.Where(predicate);
+        }
+
+        public static async Task<List<TEntity>> Meterialize<TEntity>(this IQueryable<TEntity> query) where TEntity : class
+        {
+            if (query.HasIncludes())
+                query = query.AsSplitQuery();
+
+            return await query.ToListAsync();
+        }
+
+        public static IQueryable<TEntity> OrderBy<TEntity, TOrderKey>(this IQueryable<TEntity> entities, Expression<Func<TEntity, TOrderKey>> orderExpression, SortDirection sortDirection) where TEntity : class
+        {
+            if (orderExpression == null)
+                throw new ArgumentNullException(nameof(orderExpression));
+
+
+            return sortDirection switch
+            {
+                SortDirection.Ascending => entities.OrderBy(orderExpression),
+                SortDirection.Descending => entities.OrderByDescending(orderExpression),
+                _ => entities
+            };
+        }
+
+
+        public static IQueryable<TResult> Project<TEntity, TResult>(this IQueryable<TEntity> entities, Expression<Func<TEntity, TResult>> projectionExpression) where TEntity : class where TResult : class
+        {
+
+            if (projectionExpression == null)
+                throw new ArgumentNullException(nameof(projectionExpression));
+
+            return entities.Select(projectionExpression);
+        }
+
+        /// <summary>
+        /// Extension method to retrieve page of data
+        /// </summary>
+        /// <typeparam name="TEntity">the entity to be queried</typeparam>
+        /// <param name="entities">the query to be paged</param>
+        /// <param name="pageSize">page size should be greater than 1</param>
+        /// <param name="pageIndex">page index starting from zero</param>
+        /// <returns>new query that contains the page</returns>
+        /// <exception cref="ArgumentOutOfRangeException">will be thrown if the pagesize or page index are invalid</exception>
+        public static async Task<(IQueryable<TEntity> query, int count)> PageAsync<TEntity>(this IQueryable<TEntity> entities, int pageSize, int pageIndex) where TEntity : class
+        {
+            // validate page index
+            if (pageIndex < 0)
+                throw new ArgumentOutOfRangeException(nameof(pageIndex));
+
+            // validate page size
+            if (pageSize < 1)
+                throw new ArgumentOutOfRangeException(nameof(pageSize));
+
+            // execute count
+            var count = await entities.CountAsync();
+
+            // perform paging.
+            var query = entities.Skip(pageSize * pageIndex).Take(pageSize);
+
+            return (query, count);
+        }
+
+
+
+        public static async Task<(IQueryable<TEntity> query, int count)> QueryPagedAsync<TEntity>(this IQueryable<TEntity> entities,
+            Expression<Func<TEntity, bool>> predicate, int pageSize, int pageIndex) where TEntity : class
+            => await entities.Query(predicate).PageAsync(pageSize, pageIndex);
+
+        public static IQueryable<TEntity> QueryOrdered<TEntity, TOrderKey>(this IQueryable<TEntity> entities,
+                                                             Expression<Func<TEntity, bool>> predicate,
+                                                             Expression<Func<TEntity, TOrderKey>> orderExpression,
+                                                             SortDirection sortDirection) where TEntity : class
+            => entities.Query(predicate).OrderBy(orderExpression, sortDirection);
+
+
+        public static async Task<(IQueryable<TEntity> query, int count)> QueryOrderedPagedAsync<TEntity, TOrderKey>(this IQueryable<TEntity> entities,
+                                                             Expression<Func<TEntity, bool>> predicate,
+                                                             Expression<Func<TEntity, TOrderKey>> orderExpression,
+                                                             SortDirection sortDirection,
+                                                             int pageSize,
+                                                             int pageIndex) where TEntity : class
+            => await entities.Query(predicate).OrderBy(orderExpression, sortDirection).PageAsync(pageSize, pageIndex);
+
+
+        public static IQueryable<TResult> QueryProjection<TEntity, TResult>(this IQueryable<TEntity> entities, Expression<Func<TResult, bool>> predicate, Expression<Func<TEntity, TResult>> projectionExpression) where TEntity : class where TResult : class
+            => entities.Project(projectionExpression).Query(predicate);
+        public static async Task<(IQueryable<TResult> query, int count)> QueryProjectionPagedAsync<TEntity, TResult>(this IQueryable<TEntity> entities,
+                                                             Expression<Func<TEntity, TResult>> projectionExpression,
+                                                             Expression<Func<TResult, bool>> predicate,
+                                                             int pageSize,
+                                                             int pageIndex)
+                                                        where TEntity : class
+                                                        where TResult : class
+            => await entities.Project(projectionExpression).Query(predicate).PageAsync(pageSize, pageIndex);
+
+        public static IQueryable<TResult> QueryProjectionOrdered<TEntity, TResult, TOrderKey>(this IQueryable<TEntity> entities,
+                                                             Expression<Func<TResult, bool>> predicate,
+                                                             Expression<Func<TEntity, TResult>> projectionExpression,
+                                                             Expression<Func<TResult, TOrderKey>> orderExpression,
+                                                             SortDirection sortDirection) where TEntity : class where TResult : class
+            => entities.Project(projectionExpression).Query(predicate).OrderBy(orderExpression, sortDirection);
+
+
+        public static async Task<(IQueryable<TResult> query, int count)> QueryProjectionOrderedPagedAsync<TEntity, TResult, TOrderKey>(this IQueryable<TEntity> entities,
+                                                             Expression<Func<TResult, bool>> predicate,
+                                                             Expression<Func<TEntity, TResult>> projectionExpression,
+                                                             Expression<Func<TResult, TOrderKey>> orderExpression,
+                                                             SortDirection sortDirection,
+                                                             int pageSize,
+                                                             int pageIndex) where TEntity : class where TResult : class
+            => await entities.Project(projectionExpression).Query(predicate).OrderBy(orderExpression, sortDirection).PageAsync(pageSize, pageIndex);
+
+
+
+        public static IQueryable<TResult> QueryProjection<TEntity, TResult>(this IQueryable<TEntity> entities, Expression<Func<TEntity, bool>> predicate, Expression<Func<TEntity, TResult>> projectionExpression) where TEntity : class where TResult : class
+            => entities.Query(predicate).Project(projectionExpression);
+        public static async Task<(IQueryable<TResult> query, int count)> QueryProjectionPagedAsync<TEntity, TResult>(this IQueryable<TEntity> entities,
+                                                             Expression<Func<TEntity, TResult>> projectionExpression,
+                                                             Expression<Func<TEntity, bool>> predicate,
+                                                             int pageSize,
+                                                             int pageIndex)
+                                                        where TEntity : class
+                                                        where TResult : class
+            => await entities.Query(predicate).Project(projectionExpression).PageAsync(pageSize, pageIndex);
+
+        public static IQueryable<TResult> QueryProjectionOrdered<TEntity, TResult, TOrderKey>(this IQueryable<TEntity> entities,
+                                                             Expression<Func<TEntity, bool>> predicate,
+                                                             Expression<Func<TEntity, TResult>> projectionExpression,
+                                                             Expression<Func<TEntity, TOrderKey>> orderExpression,
+                                                             SortDirection sortDirection) where TEntity : class where TResult : class
+            => entities.Query(predicate).OrderBy(orderExpression, sortDirection).Project(projectionExpression);
+
+
+        public static async Task<(IQueryable<TResult> query, int count)> QueryProjectionOrderedPagedAsync<TEntity, TResult, TOrderKey>(this IQueryable<TEntity> entities,
+                                                             Expression<Func<TEntity, bool>> predicate,
+                                                             Expression<Func<TEntity, TResult>> projectionExpression,
+                                                             Expression<Func<TEntity, TOrderKey>> orderExpression,
+                                                             SortDirection sortDirection,
+                                                             int pageSize,
+                                                             int pageIndex) where TEntity : class where TResult : class
+            => await entities.Query(predicate).OrderBy(orderExpression, sortDirection).Project(projectionExpression).PageAsync(pageSize, pageIndex);
+
+
+
+        public static bool HasIncludes<T>(this IQueryable<T> query)
+        {
+            var expression = query.Expression.ToString();
+            return expression.Contains("Include") || expression.Contains("ThenInclude");
+        }
+    }
+}
+
+
+
+--------------------------------------------------------------------------------
+

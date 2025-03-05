@@ -1,0 +1,3809 @@
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\ApplicationServices\AuthenticationApplicationService.cs
+
+using Infrastructure.Security;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.ApplicationServices
+{
+    public class AuthenticationApplicationService
+    {
+        private readonly AuthenticationService _authenticationService;
+        private readonly JwtTokenService _jwtTokenService;
+        private readonly MultiFactorAuthenticationService _MultiFactorAuthenticationService;
+
+        public AuthenticationApplicationService(AuthenticationService authenticationService, JwtTokenService jwtTokenService, MultiFactorAuthenticationService multiFactorAuthenticationService)
+        {
+            _authenticationService = authenticationService;
+            _jwtTokenService = jwtTokenService;
+            _MultiFactorAuthenticationService = multiFactorAuthenticationService;
+        }
+
+        public async Task<string> Login(string username, string password)
+        {
+            var user = await _authenticationService.Authenticate(username, password);
+            if (user == null)
+               throw  new Exception("Invalid username or password.");
+
+            if (user.IsMfaEnabled)
+            {
+                await _MultiFactorAuthenticationService.SendMfaCode(user);
+                throw new InvalidOperationException("MFA code required.");
+            }
+
+            return _jwtTokenService.GenerateToken(user);
+        }
+
+        public async Task<string> VerifyMfa(string username, string mfaCode)
+        {
+            var user = await _authenticationService.GetUserByUsername(username);
+            if (user == null || !_MultiFactorAuthenticationService.VerifyMfaCode(user, mfaCode))
+                throw new UnauthorizedAccessException("Invalid MFA code.");
+
+            return _jwtTokenService.GenerateToken(user);
+        }
+
+        public async Task<string> Register(string username, string email, string password)
+        {
+            var user = await _authenticationService.Register(username, email, password);
+            return _jwtTokenService.GenerateToken(user);
+        }
+
+        public async Task RevokeToken(string token)
+        {
+            await _jwtTokenService.RevokeToken(token);
+        }
+
+        public async Task<string> RefreshToken(string token)
+        {
+            return await _jwtTokenService.RefreshToken(token);
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\ApplicationServices\IAuthService.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.ApplicationServices
+{
+    // public interface IAuthService
+    //{
+    //    Task<AuthModel> RegisterAsync(RegisterModel model);
+    //    Task<AuthModel> GetTokenAsync(TokenRequestModel model);
+    //    Task<string> AddRoleAsync(AddRoleModel model);
+    //    Task<AuthModel> RefreshTokenAsync(string token);
+    //    Task<bool> RevokeTokenAsync(string token);
+    //}
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\ApplicationServices\PermissionApplicationService.cs
+
+using Domain.Entities;
+using Domain.Repositories;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.ApplicationServices
+{
+    public class PermissionApplicationService
+    {
+        private readonly IPermissionRepository _permissionRepository;
+
+        public PermissionApplicationService(IPermissionRepository permissionRepository)
+        {
+            _permissionRepository = permissionRepository;
+        }
+
+        public async Task<PagedResult<Permission>> GetPermissionsPaginatedAsync(int pageNumber, int pageSize)
+        {
+            return await _permissionRepository.GetAllAsync(pageNumber, pageSize);
+        }
+        public async Task<Permission> CreatePermissionAsync(string name, string userType)
+        {
+            var permission = new Permission(name, userType);
+            await _permissionRepository.AddAsync(permission);
+            return permission;
+        }
+
+        public async Task<Permission> GetPermissionByNameAsync(string name)
+        {
+            return await _permissionRepository.GetByNameAsync(name);
+        }
+        public async Task<Permission> GetPermissionByIdAsync(Guid id)
+        {
+            return await _permissionRepository.GetByIdAsync(id);
+        }
+        public async Task UpdatePermissionAsync(Permission permission)
+        {
+            await _permissionRepository.UpdateAsync(permission);
+        }
+
+        public async Task DeletePermissionAsync(Guid id)
+        {
+            await _permissionRepository.DeleteAsync(id);
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\ApplicationServices\RoleApplicationService.cs
+
+using Domain.Entities;
+using Domain.Repositories;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.ApplicationServices
+{
+    public class RoleApplicationService
+    {
+        private readonly IRoleRepository _roleRepository;
+        private readonly ITenantRepository _tenantRepository;
+        private readonly IPermissionRepository _permissionRepository;
+
+        public RoleApplicationService(IRoleRepository roleRepository, 
+            ITenantRepository tenantRepository ,
+            IPermissionRepository permissionRepository)
+        {
+            _roleRepository = roleRepository;
+            _tenantRepository = tenantRepository;
+            _permissionRepository = permissionRepository;
+
+        }
+
+  
+
+        public async Task<PagedResult<Role>> GetRolesPaginatedAsync(int pageNumber, int pageSize)
+        {
+            return await _roleRepository.GetAllAsync(pageNumber, pageSize);
+        }
+        public async Task CreateRole(string tenantId, string roleName, int userType, bool isSystem, List<Permission> permissions, List<RoleLocalization> localizations)
+        {
+         
+            var role = new Role(roleName, userType, isSystem);
+
+           
+            foreach (var localization in localizations)
+            {
+                role.AddLocalization(localization);
+            }
+
+       
+            foreach (var perm in permissions)
+            {
+                
+                var permission = await GetOrCreatePermissionAsync(perm.Name, userType.ToString());
+                var rolePermission = new RolePermission(role.Id, permission.Id);
+                role.RolePermissions.Add(rolePermission);
+            }
+
+         
+            await _roleRepository.AddAsync(role);
+        }
+        private async Task<Permission> GetOrCreatePermissionAsync(string permissionName, string userType)
+        {
+            
+            var existingPermission = await _permissionRepository.GetByNameAsync(permissionName);
+            if (existingPermission != null)
+            {
+                return existingPermission;
+            }
+
+      
+            var newPermission = new Permission(permissionName, userType);
+            await _permissionRepository.AddAsync(newPermission);
+            return newPermission;
+        }
+        public async Task UpdateRolePermissions(Guid roleId, List<RolePermission> permissions)
+        {
+            var role = await _roleRepository.GetByIdAsync(roleId);
+            foreach (var permission in permissions)
+            {
+                role.AddRolePermission(permission);
+            }
+            
+            await _roleRepository.UpdateAsync(role);
+        }
+        public async Task UpdateRoleLocalizations(Guid roleId, List<RoleLocalization> RolesLocalization)
+        {
+            var role = await _roleRepository.GetByIdAsync(roleId);
+            foreach (var RoleLocalization in RolesLocalization)
+            {
+                role.AddLocalization(RoleLocalization);
+            }
+
+            await _roleRepository.UpdateAsync(role);
+        }
+
+
+        public async Task DeleteRole(Guid roleId)
+        {
+            await _roleRepository.DeleteAsync(roleId);
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\ApplicationServices\TenantApplicationService.cs
+
+using Application.DTOs;
+using Domain.Entities;
+using Domain.Repositories;
+using Infrastructure.Persistence.Repositories;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.ApplicationServices
+{
+    public class TenantApplicationService
+    {
+        private readonly ITenantRepository _tenantRepository;
+
+        public TenantApplicationService(ITenantRepository tenantRepository)
+        {
+            _tenantRepository=tenantRepository;
+        }
+
+        public async Task<PagedResult<Tenant>> GetTenatsPaginatedAsync(int pageNumber, int pageSize)
+        {
+            return await _tenantRepository.GetAllAsync(pageNumber, pageSize);
+        }
+        public async Task CreateTenant(CreateTenantRequest request) 
+        {
+            var tenant = new Tenant(request.Name);
+            await _tenantRepository.AddAsync(tenant);
+        }
+
+        public async Task UpdateTenant(UpdateTenantRequest request)
+        {
+            var tenant = await _tenantRepository.GetByIdAsync(request.TenantId);
+            tenant.UpdateName(request.Name);
+            await _tenantRepository.UpdateAsync(tenant);
+        }
+
+        public async Task DeleteTenant(DeleteTenantRequest request) 
+        {
+            await _tenantRepository.DeleteAsync(request.TenantId);
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\ApplicationServices\UserApplicationService.cs
+
+using Application.DTOs;
+using Domain.Entities;
+using Domain.Repositories;
+using Domain.ValueObjects;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.ApplicationServices
+{
+    public class UserApplicationService
+    {
+        private readonly IUserRepository _userRepository;
+        private readonly ITenantRepository _tenantRepository;
+
+        public UserApplicationService(IUserRepository userRepository, ITenantRepository tenantRepository)
+        {
+            _userRepository = userRepository;
+            _tenantRepository = tenantRepository;
+        }
+
+        public async Task RegisterUser(RegisterUserRequest request)
+        {
+            var email = new Email(request.Email);
+            var user = new User(request.Username, email, new byte[0], new byte[0]); // Add proper password hashing
+
+            await _userRepository.AddAsync(user);
+
+            foreach (var tenantId in request.TenantIds)
+            {
+                var tenant = await _tenantRepository.GetByIdAsync(tenantId);
+                user.AddTenant(tenant, request.Role); // Correct method call
+            }
+            await _userRepository.UpdateAsync(user);
+        }
+
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\ApplicationServices\UserProfileApplicationService.cs
+
+using Domain.Entities;
+using Domain.Repositories;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.ApplicationServices
+{
+    public class UserProfileApplicationService
+    {
+        private readonly IUserRepository _userRepository;
+
+        public UserProfileApplicationService(IUserRepository userRepository)
+        {
+            _userRepository = userRepository;
+        }
+
+        public async Task UpdateUserProfile(Guid userId, string newEmail, string newUsername)
+        {
+            var user = await _userRepository.GetByIdAsync(userId);
+            user.UpdateEmail(newEmail);
+            user.UpdateUsername(newUsername);
+            await _userRepository.UpdateAsync(user);
+        }
+
+        public async Task UpdatePassword(Guid userId, string newPassword)
+        {
+            var user = await _userRepository.GetByIdAsync(userId);
+            byte[] passwordHash, passwordSalt;
+            User.CreatePasswordHash(newPassword, out passwordHash, out passwordSalt);
+            user.UpdatePassword(passwordHash, passwordSalt);
+            await _userRepository.UpdateAsync(user);
+        }
+
+        public async Task EnableMultiFactorAuthentication(Guid userId, string secretKey)
+        {
+            var user = await _userRepository.GetByIdAsync(userId);
+            user.EnableMultiFactorAuthitication(secretKey);
+            await _userRepository.UpdateAsync(user);
+        }
+
+        public async Task DisableMultiFactorAuthentication(Guid userId)
+        {
+            var user = await _userRepository.GetByIdAsync(userId);
+            user.DisableMultiFactorAuthitication();
+            await _userRepository.UpdateAsync(user);
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\AddUserToTenantRequest.cs
+
+using Domain.ValueObjects;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class AddUserToTenantRequest
+    {
+        public Guid UserId { get; set; }
+        public Guid TenantId { get; set; }
+        public TenantRole Role { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\CreatePermissionRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class CreatePermissionRequest
+{
+        public string Name { get; set; }
+        public string UserType { get; set; }
+}
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\CreateRoleRequest.cs
+
+using Domain.Entities;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class CreateRoleRequest
+    {
+        public string TenantId { get; set; }
+        public string RoleName { get; set; }
+        public int UserType { get; set; }
+        public bool isSystem { get; set; }
+        public List<Permission> Permissions { get; set; }
+        public List<RoleLocalization> localizations { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\CreateTenantRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class CreateTenantRequest
+    {
+        public string Name { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\DeleteRoleRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class DeleteRoleRequest
+    {
+        public Guid RoleId { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\DeleteTenantRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class DeleteTenantRequest
+    {
+        public Guid TenantId { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\DisableMfaRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class DisableMultiFactorAuthenticationRequest
+    {
+        public Guid UserId { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\EnableMfaRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class EnableMultiFactorAuthenticationRequest
+    {
+        public Guid UserId { get; set; }
+        public string SecretKey { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\LoginRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class LoginRequest
+    {
+        public string Username { get; set; }
+        public string Password { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\RefreshTokenRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class RefreshTokenRequest
+    {
+        public string Token { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\RegisterRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class RegisterRequest
+    {
+        public string Username { get; set; }
+        public string Email { get; set; }
+        public string Password { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\RegisterUserRequest.cs
+
+using Domain.ValueObjects;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class RegisterUserRequest
+    {
+        public string Username { get; set; }
+        public string Email {  get; set; }
+        public List<Guid> TenantIds {  get; set; }
+        public TenantRole Role { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\RemoveUserFromTenantRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class RemoveUserFromTenantRequest
+    {
+        public Guid UserId { get; set; }
+        public Guid TenantId { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\RevokeTokenRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class RevokeTokenRequest
+    {
+        public string Token { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\SecurityEventRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class SecurityEventRequest
+    {
+        public string EventType { get; set; }
+        public string Details { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\UpdatePasswordRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class UpdatePasswordRequest
+    {
+        public Guid UserId { get; set; }
+        public string NewPassword { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\UpdatePermissionRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class UpdatePermissionRequest
+{
+        public string Name { get; set; }
+        public string UserType { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\UpdateRolePermissionsRequest.cs
+
+using Domain.Entities;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class UpdateRolePermissionsRequest
+    {
+        public Guid RoleId { get; set; }
+        public List<RolePermission> Permissions { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\UpdateTenantRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class UpdateTenantRequest
+    {
+        public Guid TenantId { get; set; }
+        public string Name { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\UpdateUserProfileRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class UpdateUserProfileRequest
+    {
+        public Guid UserId { get; set; }
+        public string NewEmail { get; set; }
+        public string NewUsername { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\VerifyMfaRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class VerifyMfaRequest
+    {
+        public string Username { get; set; }
+        public string MfaCode { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\Security\RoleBasedAccessControl.cs
+
+using Domain.ValueObjects;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.Security
+{
+    public class RoleBasedAccessControl
+    {
+         private readonly Dictionary<TenantRole, List<string>> _rolePermissions;
+
+        public RoleBasedAccessControl()
+        {
+            _rolePermissions = new Dictionary<TenantRole, List<string>>
+            {
+                { TenantRole.SuperAdmin, new List<string> { "ManageTenants", "ManageUsers", "ViewReports" } },
+                { TenantRole.TenantAdmin, new List<string> { "ManageUsers", "AssignRoles" } },
+                { TenantRole.User, new List<string> { "ViewContent" } }
+            };
+        }
+
+        public bool HasPermission(TenantRole role, string permission)
+        {
+            if (_rolePermissions.TryGetValue(role, out var permissions))
+            {
+                return permissions.Contains(permission);
+            }
+
+            return false;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Aggregates\TenantAggregate.cs
+
+using Domain.Entities;
+using Domain.ValueObjects;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.Aggregates
+{
+    public class TenantAggregate
+    {
+        public Tenant Tenant {  get; private set; }
+        public List<User> Users { get; private set; }
+
+        public TenantAggregate(Tenant tenant) 
+        {
+            Tenant = tenant;
+            Users = new List<User>();
+        }
+
+        public void AddUser(User user, TenantRole role)
+        {
+           Tenant.AddUser(user, role);
+            if (!Users.Contains(user))
+            {
+                Users.Add(user);
+            }
+        }
+        public void RemoveUser(User user) { 
+            Tenant.UserTenants.RemoveAll(ut => ut.User.Id == user.Id);
+            Users.Remove(user);
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Aggregates\UserAggregate.cs
+
+using Domain.Entities;
+using Domain.ValueObjects;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.Aggregates
+{
+    public class UserAggregate
+    {
+        public User User { get; private set; }
+        public List<UserTenant> UserTenants => User.UserTenants;
+
+        public UserAggregate(User user)
+        {
+            User = user;
+        }
+
+        public void UpdateEmail(string newEmail)
+        {
+        }
+
+        public void UpdateUsername(string newUsername)
+        {
+        }
+
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\DomainEvents\TenantCreatedEvent.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.DomainEvents
+{
+    public class TenantCreatedEvent
+    {
+        public Guid TenantId { get; private set;}
+        public string TenantName {  get; private set;}
+
+        public TenantCreatedEvent(Guid tenantId, string tenantName)
+        {
+            TenantId=tenantId;
+            TenantName=tenantName;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\DomainEvents\UserRegisteredEvent .cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.DomainEvents
+{
+    public class UserRegisteredEvent 
+    {
+        public Guid UserId { get; private set; }
+        public string UserName { get; private set; }
+        public string Email { get; private set; }
+
+        public UserRegisteredEvent(Guid userId, string username, string email)
+        {
+            UserId = userId;
+            UserName = username;
+            Email = email;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\DomainServices\TenantManagementService.cs
+
+using Domain.Entities;
+using Domain.Repositories;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.DomainServices
+{
+    public class TenantManagementService
+    {
+        private readonly ITenantRepository _tenantRepository;
+
+        public TenantManagementService(ITenantRepository tenantRepository)
+        {
+            _tenantRepository = tenantRepository;
+        }
+
+        public async Task CreateTenantAsync(Tenant tenant)
+        {
+            await _tenantRepository.AddAsync(tenant);
+        }
+
+        public async Task UpdateTenantAsync(Tenant tenant)
+        {
+            await _tenantRepository.UpdateAsync(tenant);
+        }
+
+        public async Task DeleteTenantAsync(Guid tenantId)
+        {
+            await _tenantRepository.DeleteAsync(tenantId);
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\DomainServices\UserManagementService.cs
+
+using Domain.Entities;
+using Domain.Repositories;
+using Domain.ValueObjects;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.DomainServices
+{
+    public class UserManagementService
+    {
+        private readonly IUserRepository _userRepository;
+        private readonly ITenantRepository _tenantRepository;
+
+        public UserManagementService(IUserRepository userRepository, ITenantRepository tenantRepository)
+        {
+            _userRepository = userRepository;
+            _tenantRepository = tenantRepository;
+        }
+
+        public async Task RegisterUserAsync(User user)
+        {
+            await _userRepository.AddAsync(user);
+        }
+
+        public async Task AddUserToTenantAsync(User user, Tenant tenant, TenantRole role)
+        {
+            user.AddTenant(tenant, role);
+            await _userRepository.UpdateAsync(user);
+        }
+
+        public async Task RemoveUserFromTenantAsync(User user, Tenant tenant)
+        {
+            user.RemoveTenant(tenant);
+            await _userRepository.UpdateAsync(user);
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\Permission.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using SharedDomain.Common;
+
+namespace Domain.Entities
+{
+    public class Permission : BaseEntity
+    {
+        public string Name { get; set; }
+        public string UserType { get; set; }
+        public ICollection<PermissionLocalization> Localizations { get; private set; }
+        public List<RolePermission> RolePermissions { get; private set; }
+
+        public Permission(string name, string userType)
+        {
+            Name = name;
+            UserType = userType;
+        }
+
+        public void AddLocalization(PermissionLocalization localization)
+        {
+            Localizations.Add(localization);
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\PermissionLocalization.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using SharedDomain.Common;
+
+
+namespace Domain.Entities
+{
+    public class PermissionLocalization : BaseEntity
+    {
+        public Guid PermissionId { get; private set; }
+        public int LanguageId { get; private set; }
+        public string Name { get; private set; }
+
+        public Permission Permission { get; private set; }
+
+        public PermissionLocalization(Guid permissionId, int languageId, string name)
+        {
+            PermissionId = permissionId;
+            LanguageId = languageId;
+            Name = name;
+        }
+    }
+
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\Role.cs
+
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.Entities
+{
+    public class Role : BaseEntity
+    {
+        public string ConcurrencyStamp { get; private set; }
+        public string NormalizedName { get; private set; }
+        public DateTime CreateDate { get; private set; }
+        public bool IsActive { get; private set; }
+        public int UserType { get; private set; }
+        public bool IsSystem { get; private set; }
+        public int RoleTypeID { get; private set; }
+        public List<RoleLocalization> Localizations { get; private set; } = new();
+        public List<RolePermission> RolePermissions { get; private set; } = new();
+
+        public List<UserRole> UserRoles { get; private set; } = new();
+
+        public Role(string normalizedName, int userType, bool isSystem=false)
+        {
+            NormalizedName = normalizedName;
+            UserType = userType;
+            IsSystem = isSystem;
+            ConcurrencyStamp = Guid.NewGuid().ToString();
+            CreateDate = DateTime.UtcNow;
+            IsActive = true;
+        }
+
+        public void AddLocalization(RoleLocalization localization)
+        {
+            Localizations.Add(localization);
+        }
+        public void AddRolePermission(RolePermission localization)
+        {
+            RolePermissions.Add(localization);
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\RoleLocalization.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using SharedDomain.Common;
+
+namespace Domain.Entities
+{
+    public class RoleLocalization : BaseEntity
+    {
+        public Guid RoleId { get; private set; }
+        public int LanguageId { get; private set; }
+        public string Name { get; private set; }
+
+        public Role Role { get; private set; }
+
+        public RoleLocalization(Guid roleId, int languageId, string name)
+        {
+            RoleId = roleId;
+            LanguageId = languageId;
+            Name = name;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\RolePermission .cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using SharedDomain.Common;
+
+namespace Domain.Entities
+{
+    public class RolePermission : BaseEntity
+    {
+        public Guid RoleId { get; private set; }
+        public Guid PermissionId { get; private set; }
+
+        public Role Role { get; private set; }
+        public Permission Permission { get; private set; }
+
+        public RolePermission(Guid roleId, Guid permissionId)
+        {
+            RoleId = roleId;
+            PermissionId = permissionId;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\Tenant.cs
+
+using Domain.ValueObjects;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.Entities
+{
+    public class Tenant : BaseEntity
+    {
+        public string Name { get; private set; }
+
+        public List<UserTenant> UserTenants { get; private set; } = new List<UserTenant>();
+
+
+        public Tenant(string name)
+        {
+            Name = name;
+        }
+
+        public void AddUser(User user, TenantRole role)
+        {
+            var userTenant = new UserTenant(user, this, role);
+            UserTenants.Add(userTenant);
+        }
+
+        public void UpdateName(string name)
+        {
+            Name = name;
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\User.cs
+
+using Domain.DomainEvents;
+using Domain.ValueObjects;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Collections.ObjectModel;
+using SharedDomain.Common;
+using System.Runtime.Serialization;
+namespace Domain.Entities
+{
+    public class User : BaseEntity
+    {
+        public string Username { get; private set; }
+        public byte[] PasswordHash { get; private set; }
+        public byte[] PasswordSalt { get; private set; }
+        
+        public Email Email { get; private set; }
+        public bool IsMfaEnabled { get; private set; }
+        public string MfaSecretKey { get; private set; }
+
+  
+        public List<UserTenant> UserTenants { get; private set; } = new List<UserTenant>();
+        public List<UserRole> UserRoles { get; private set; } = new List<UserRole>();
+
+        public User() { }
+
+        public User(string username, Email email, byte[] passwordHash, byte[] passwordSalt)
+        {
+            Username = username;
+            Email = email;
+            PasswordHash = passwordHash;
+            PasswordSalt = passwordSalt;
+            IsMfaEnabled = false;
+            MfaSecretKey = string.Empty;
+        }
+
+        public void EnableMultiFactorAuthitication(string secretKey)
+        {
+            IsMfaEnabled = true;
+            MfaSecretKey = secretKey;
+        }
+
+        public void DisableMultiFactorAuthitication()
+        {
+            IsMfaEnabled = false;
+            MfaSecretKey = string.Empty;
+        }
+
+        public void UpdatePassword(byte[] passwordHash, byte[] passwordSalt)
+        {
+            PasswordHash = passwordHash;
+            PasswordSalt = passwordSalt;
+        }
+
+        public void UpdateEmail(string newEmail)
+        {
+            Email = new Email(newEmail);
+        }
+
+        public void UpdateUsername(string newUsername)
+        {
+            Username = newUsername;
+        }
+
+        public static void CreatePasswordHash(string password, out byte[] passwordHash, out byte[] passwordSalt)
+        {
+            using (var hmac = new System.Security.Cryptography.HMACSHA512())
+            {
+                passwordSalt = hmac.Key;
+                passwordHash = hmac.ComputeHash(System.Text.Encoding.UTF8.GetBytes(password));
+            }
+        }
+
+        public void AddTenant(Tenant tenant, TenantRole role)
+        {
+            var userTenant = new UserTenant(this, tenant, role);
+            UserTenants.Add(userTenant);
+        }
+
+        public void RemoveTenant(Tenant tenant)
+        {
+            UserTenants.RemoveAll(ut => ut.TenantId == tenant.Id);
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\UserRole.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using SharedDomain.Common;
+
+namespace Domain.Entities
+{
+    public class UserRole : BaseEntity
+    {
+        public Guid UserId { get; private set; }
+        public Guid RoleId { get; private set; }
+        public Guid TenantId { get; private set; }
+
+        public User User { get; private set; }
+        public Role Role { get; private set; }
+        public Tenant Tenant { get; private set; }
+
+
+        public UserRole(Guid userId, Guid roleId, Guid tenantId)
+        {
+            UserId = userId;
+            RoleId = roleId;
+            TenantId = tenantId;
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\UserTenant.cs
+
+using Domain.ValueObjects;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using SharedDomain.Common;
+
+namespace Domain.Entities
+{
+    public class UserTenant : BaseEntity
+    {
+
+
+        public Guid UserId { get; private set; }
+        public Guid TenantId { get; private set; }
+
+        public User User { get; private set; }
+        public Tenant Tenant { get; private set; }
+        public TenantRole Role { get; private set; }
+
+
+        public UserTenant(User user, Tenant tenant, TenantRole role)
+        {
+            User = user;
+            Tenant = tenant;
+            Role = role;
+            UserId = user.Id;
+            TenantId = tenant.Id;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Repositories\IPermissionRepository.cs
+
+using Domain.Entities;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.Repositories
+{
+    public interface IPermissionRepository
+    {
+        Task<Permission> GetByIdAsync(Guid id);
+        Task<Permission> GetByNameAsync(string name);
+        Task<PagedResult<Permission>> GetAllAsync(int pageNumber, int pageSize);
+        Task AddAsync(Permission permission);
+        Task UpdateAsync(Permission permission);
+        Task DeleteAsync(Guid id);
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Repositories\IRoleRepository.cs
+
+using Domain.Entities;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.Repositories
+{
+    public interface IRoleRepository
+    {
+        Task<Role> GetByIdAsync(Guid id);
+
+        Task<PagedResult<Role>> GetAllAsync(int pageNumber, int pageSize);
+        Task AddAsync(Role role);
+        Task UpdateAsync(Role role);
+        Task DeleteAsync(Guid id);
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Repositories\ITenantRepository.cs
+
+using Domain.Entities;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.Repositories
+{
+    public interface ITenantRepository
+    {
+        Task<Tenant> GetByIdAsync(Guid id);
+
+        Task<PagedResult<Tenant>> GetAllAsync(int pageNumber, int pageSize);
+        Task AddAsync(Tenant tenant);
+        Task UpdateAsync(Tenant tenant);
+        Task DeleteAsync(Guid id);
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Repositories\IUnitOfWork.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Domain.Repositories;
+
+namespace  Domain.Repositories
+{
+public interface IUnitOfWork : IDisposable
+{
+    IUserRepository Users { get; }
+    ITenantRepository Tenants { get; }
+    IRoleRepository Roles { get; }
+
+    Task<int> CompleteAsync();
+}
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Repositories\IUserRepository.cs
+
+using Domain.Entities;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.Repositories
+{
+    public interface IUserRepository
+    {
+        Task<User> GetByIdAsync(Guid id);
+
+        Task<PagedResult<User>> GetAllAsync(int pageNumber, int pageSize);
+        Task AddAsync(User user);
+        Task DeleteAsync(Guid id);
+        Task UpdateAsync(User user);
+        Task<User> GetByUsernameAsync(string username);
+        Task<bool> UserExists(string username, string email);
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\ValueObjects\Email.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+
+namespace Domain.ValueObjects
+{
+    public class Email
+    {
+        public string Value { get; private init; }
+
+        public Email(string value)
+        {
+            if (!Regex.IsMatch(value, @"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"))
+                throw new Exception("Invalid email format.");
+
+            Value = value;
+        }
+
+        public override string ToString()
+        {
+            return Value;
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\ValueObjects\PhoneNumber.cs
+
+using System;
+
+namespace Domain.ValueObjects
+{
+    public class PhoneNumber
+    {
+        public string Value { get; private set; }
+
+        public PhoneNumber(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+                throw new ArgumentException("Phone number cannot be empty", nameof(value));
+            if (!System.Text.RegularExpressions.Regex.IsMatch(value, @"^\+?[1-9]\d{1,14}$"))
+                throw new ArgumentException("Invalid phone number format", nameof(value));
+
+            Value = value;
+        }
+
+        public override string ToString()
+        {
+            return Value;
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\ValueObjects\TenantRole.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.ValueObjects
+{
+    public enum TenantRole
+    {
+        SuperAdmin,
+        TenantAdmin,
+        User
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Migrations\20250221161238_InitialCreate.cs
+
+using System;
+using Microsoft.EntityFrameworkCore.Migrations;
+
+#nullable disable
+
+namespace Infrastructure.Migrations
+{
+    /// <inheritdoc />
+    public partial class InitialCreate : Migration
+    {
+        /// <inheritdoc />
+        protected override void Up(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.CreateTable(
+                name: "Roles",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uniqueidentifier", nullable: false),
+                    Name = table.Column<string>(type: "nvarchar(max)", nullable: false),
+                    Permissions = table.Column<string>(type: "nvarchar(max)", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_Roles", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "Tenants",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uniqueidentifier", nullable: false),
+                    Name = table.Column<string>(type: "nvarchar(450)", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_Tenants", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "Users",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uniqueidentifier", nullable: false),
+                    Username = table.Column<string>(type: "nvarchar(max)", nullable: false),
+                    PasswordHash = table.Column<byte[]>(type: "varbinary(max)", nullable: false),
+                    PasswordSalt = table.Column<byte[]>(type: "varbinary(max)", nullable: false),
+                    Email_Value = table.Column<string>(type: "nvarchar(450)", nullable: false),
+                    IsMfaEnabled = table.Column<bool>(type: "bit", nullable: false),
+                    MfaSecretKey = table.Column<string>(type: "nvarchar(max)", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_Users", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "UserRoles",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uniqueidentifier", nullable: false),
+                    UserId = table.Column<Guid>(type: "uniqueidentifier", nullable: false),
+                    RoleId = table.Column<Guid>(type: "uniqueidentifier", nullable: false),
+                    TenantId = table.Column<Guid>(type: "uniqueidentifier", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_UserRoles", x => x.Id);
+                    table.ForeignKey(
+                        name: "FK_UserRoles_Roles_RoleId",
+                        column: x => x.RoleId,
+                        principalTable: "Roles",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                    table.ForeignKey(
+                        name: "FK_UserRoles_Tenants_TenantId",
+                        column: x => x.TenantId,
+                        principalTable: "Tenants",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                    table.ForeignKey(
+                        name: "FK_UserRoles_Users_UserId",
+                        column: x => x.UserId,
+                        principalTable: "Users",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "UserTenants",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uniqueidentifier", nullable: false),
+                    UserId = table.Column<Guid>(type: "uniqueidentifier", nullable: false),
+                    TenantId = table.Column<Guid>(type: "uniqueidentifier", nullable: false),
+                    Role = table.Column<int>(type: "int", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_UserTenants", x => x.Id);
+                    table.ForeignKey(
+                        name: "FK_UserTenants_Tenants_TenantId",
+                        column: x => x.TenantId,
+                        principalTable: "Tenants",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                    table.ForeignKey(
+                        name: "FK_UserTenants_Users_UserId",
+                        column: x => x.UserId,
+                        principalTable: "Users",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_Tenants_Name",
+                table: "Tenants",
+                column: "Name",
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "IX_UserRoles_RoleId",
+                table: "UserRoles",
+                column: "RoleId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_UserRoles_TenantId",
+                table: "UserRoles",
+                column: "TenantId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_UserRoles_UserId",
+                table: "UserRoles",
+                column: "UserId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_Users_Email_Value",
+                table: "Users",
+                column: "Email_Value",
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "IX_UserTenants_TenantId",
+                table: "UserTenants",
+                column: "TenantId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_UserTenants_UserId",
+                table: "UserTenants",
+                column: "UserId");
+        }
+
+        /// <inheritdoc />
+        protected override void Down(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.DropTable(
+                name: "UserRoles");
+
+            migrationBuilder.DropTable(
+                name: "UserTenants");
+
+            migrationBuilder.DropTable(
+                name: "Roles");
+
+            migrationBuilder.DropTable(
+                name: "Tenants");
+
+            migrationBuilder.DropTable(
+                name: "Users");
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Migrations\20250221161238_InitialCreate.Designer.cs
+
+// <auto-generated />
+using System;
+using Infrastructure.Persistence;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
+
+#nullable disable
+
+namespace Infrastructure.Migrations
+{
+    [DbContext(typeof(AppDbContext))]
+    [Migration("20250221161238_InitialCreate")]
+    partial class InitialCreate
+    {
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
+        {
+#pragma warning disable 612, 618
+            modelBuilder
+                .HasAnnotation("ProductVersion", "9.0.2")
+                .HasAnnotation("Relational:MaxIdentifierLength", 128);
+
+            SqlServerModelBuilderExtensions.UseIdentityColumns(modelBuilder);
+
+            modelBuilder.Entity("Domain.Entities.Role", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.PrimitiveCollection<string>("Permissions")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Roles");
+                });
+
+            modelBuilder.Entity("Domain.Entities.Tenant", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(450)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Name")
+                        .IsUnique();
+
+                    b.ToTable("Tenants");
+                });
+
+            modelBuilder.Entity("Domain.Entities.User", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<bool>("IsMfaEnabled")
+                        .HasColumnType("bit");
+
+                    b.Property<string>("MfaSecretKey")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.Property<byte[]>("PasswordHash")
+                        .IsRequired()
+                        .HasColumnType("varbinary(max)");
+
+                    b.Property<byte[]>("PasswordSalt")
+                        .IsRequired()
+                        .HasColumnType("varbinary(max)");
+
+                    b.Property<string>("Username")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Users");
+                });
+
+            modelBuilder.Entity("Domain.Entities.UserRole", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<Guid>("RoleId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<Guid>("TenantId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<Guid>("UserId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("RoleId");
+
+                    b.HasIndex("TenantId");
+
+                    b.HasIndex("UserId");
+
+                    b.ToTable("UserRoles");
+                });
+
+            modelBuilder.Entity("Domain.Entities.UserTenant", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<int>("Role")
+                        .HasColumnType("int");
+
+                    b.Property<Guid>("TenantId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<Guid>("UserId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TenantId");
+
+                    b.HasIndex("UserId");
+
+                    b.ToTable("UserTenants");
+                });
+
+            modelBuilder.Entity("Domain.Entities.User", b =>
+                {
+                    b.OwnsOne("Domain.ValueObjects.Email", "Email", b1 =>
+                        {
+                            b1.Property<Guid>("UserId")
+                                .HasColumnType("uniqueidentifier");
+
+                            b1.Property<string>("Value")
+                                .IsRequired()
+                                .HasColumnType("nvarchar(450)");
+
+                            b1.HasKey("UserId");
+
+                            b1.HasIndex("Value")
+                                .IsUnique();
+
+                            b1.ToTable("Users");
+
+                            b1.WithOwner()
+                                .HasForeignKey("UserId");
+                        });
+
+                    b.Navigation("Email")
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("Domain.Entities.UserRole", b =>
+                {
+                    b.HasOne("Domain.Entities.Role", "Role")
+                        .WithMany("UserRoles")
+                        .HasForeignKey("RoleId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("Domain.Entities.Tenant", "Tenant")
+                        .WithMany()
+                        .HasForeignKey("TenantId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("Domain.Entities.User", "User")
+                        .WithMany("UserRoles")
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Role");
+
+                    b.Navigation("Tenant");
+
+                    b.Navigation("User");
+                });
+
+            modelBuilder.Entity("Domain.Entities.UserTenant", b =>
+                {
+                    b.HasOne("Domain.Entities.Tenant", "Tenant")
+                        .WithMany("UserTenants")
+                        .HasForeignKey("TenantId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("Domain.Entities.User", "User")
+                        .WithMany("UserTenants")
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Tenant");
+
+                    b.Navigation("User");
+                });
+
+            modelBuilder.Entity("Domain.Entities.Role", b =>
+                {
+                    b.Navigation("UserRoles");
+                });
+
+            modelBuilder.Entity("Domain.Entities.Tenant", b =>
+                {
+                    b.Navigation("UserTenants");
+                });
+
+            modelBuilder.Entity("Domain.Entities.User", b =>
+                {
+                    b.Navigation("UserRoles");
+
+                    b.Navigation("UserTenants");
+                });
+#pragma warning restore 612, 618
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Migrations\AppDbContextModelSnapshot.cs
+
+// <auto-generated />
+using System;
+using Infrastructure.Persistence;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
+
+#nullable disable
+
+namespace Infrastructure.Migrations
+{
+    [DbContext(typeof(AppDbContext))]
+    partial class AppDbContextModelSnapshot : ModelSnapshot
+    {
+        protected override void BuildModel(ModelBuilder modelBuilder)
+        {
+#pragma warning disable 612, 618
+            modelBuilder
+                .HasAnnotation("ProductVersion", "9.0.2")
+                .HasAnnotation("Relational:MaxIdentifierLength", 128);
+
+            SqlServerModelBuilderExtensions.UseIdentityColumns(modelBuilder);
+
+            modelBuilder.Entity("Domain.Entities.Role", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.PrimitiveCollection<string>("Permissions")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Roles");
+                });
+
+            modelBuilder.Entity("Domain.Entities.Tenant", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(450)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Name")
+                        .IsUnique();
+
+                    b.ToTable("Tenants");
+                });
+
+            modelBuilder.Entity("Domain.Entities.User", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<bool>("IsMfaEnabled")
+                        .HasColumnType("bit");
+
+                    b.Property<string>("MfaSecretKey")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.Property<byte[]>("PasswordHash")
+                        .IsRequired()
+                        .HasColumnType("varbinary(max)");
+
+                    b.Property<byte[]>("PasswordSalt")
+                        .IsRequired()
+                        .HasColumnType("varbinary(max)");
+
+                    b.Property<string>("Username")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Users");
+                });
+
+            modelBuilder.Entity("Domain.Entities.UserRole", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<Guid>("RoleId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<Guid>("TenantId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<Guid>("UserId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("RoleId");
+
+                    b.HasIndex("TenantId");
+
+                    b.HasIndex("UserId");
+
+                    b.ToTable("UserRoles");
+                });
+
+            modelBuilder.Entity("Domain.Entities.UserTenant", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<int>("Role")
+                        .HasColumnType("int");
+
+                    b.Property<Guid>("TenantId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<Guid>("UserId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TenantId");
+
+                    b.HasIndex("UserId");
+
+                    b.ToTable("UserTenants");
+                });
+
+            modelBuilder.Entity("Domain.Entities.User", b =>
+                {
+                    b.OwnsOne("Domain.ValueObjects.Email", "Email", b1 =>
+                        {
+                            b1.Property<Guid>("UserId")
+                                .HasColumnType("uniqueidentifier");
+
+                            b1.Property<string>("Value")
+                                .IsRequired()
+                                .HasColumnType("nvarchar(450)");
+
+                            b1.HasKey("UserId");
+
+                            b1.HasIndex("Value")
+                                .IsUnique();
+
+                            b1.ToTable("Users");
+
+                            b1.WithOwner()
+                                .HasForeignKey("UserId");
+                        });
+
+                    b.Navigation("Email")
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("Domain.Entities.UserRole", b =>
+                {
+                    b.HasOne("Domain.Entities.Role", "Role")
+                        .WithMany("UserRoles")
+                        .HasForeignKey("RoleId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("Domain.Entities.Tenant", "Tenant")
+                        .WithMany()
+                        .HasForeignKey("TenantId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("Domain.Entities.User", "User")
+                        .WithMany("UserRoles")
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Role");
+
+                    b.Navigation("Tenant");
+
+                    b.Navigation("User");
+                });
+
+            modelBuilder.Entity("Domain.Entities.UserTenant", b =>
+                {
+                    b.HasOne("Domain.Entities.Tenant", "Tenant")
+                        .WithMany("UserTenants")
+                        .HasForeignKey("TenantId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("Domain.Entities.User", "User")
+                        .WithMany("UserTenants")
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Tenant");
+
+                    b.Navigation("User");
+                });
+
+            modelBuilder.Entity("Domain.Entities.Role", b =>
+                {
+                    b.Navigation("UserRoles");
+                });
+
+            modelBuilder.Entity("Domain.Entities.Tenant", b =>
+                {
+                    b.Navigation("UserTenants");
+                });
+
+            modelBuilder.Entity("Domain.Entities.User", b =>
+                {
+                    b.Navigation("UserRoles");
+
+                    b.Navigation("UserTenants");
+                });
+#pragma warning restore 612, 618
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Persistence\AppDbContext.cs
+
+using Domain.Entities;
+using Microsoft.EntityFrameworkCore;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection.Emit;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Infrastructure.Persistence
+{
+    public class AppDbContext : DbContext
+    {
+        public DbSet<User> Users { get; set; }
+        public DbSet<Tenant> Tenants { get; set; }
+        public DbSet<UserTenant> UserTenants { get; set; }
+        public DbSet<Role> Roles { get; set; }
+        public DbSet<UserRole> UserRoles { get; set; }
+
+        public DbSet<Permission> Permissions { get; set; }
+        public DbSet<PermissionLocalization> PermissionLocalizations { get; set; }
+
+        public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            base.OnModelCreating(modelBuilder);
+
+            // Configure EmailAddress as an owned type
+            modelBuilder.Entity<User>(entity =>
+            {
+                entity.OwnsOne(u => u.Email, entity =>
+                {
+                    // Add a unique constraint on the Email column
+                    entity.HasIndex(u => u.Value).IsUnique();
+                });
+            });
+
+            // Configure UserTenant relationships
+            modelBuilder.Entity<UserTenant>()
+                .HasKey(ut => ut.Id); // Primary key
+
+            modelBuilder.Entity<UserTenant>()
+                .HasOne(ut => ut.User)
+                .WithMany(u => u.UserTenants)
+                .HasForeignKey(ut => ut.UserId);
+
+            modelBuilder.Entity<UserTenant>()
+                .HasOne(ut => ut.Tenant)
+                .WithMany(t => t.UserTenants)
+                .HasForeignKey(ut => ut.TenantId);
+
+            // Configure UserRole relationships
+            modelBuilder.Entity<UserRole>()
+                .HasKey(ur => ur.Id); // Primary key
+
+            modelBuilder.Entity<UserRole>()
+                .HasOne(ur => ur.User)
+                .WithMany(u => u.UserRoles)
+                .HasForeignKey(ur => ur.UserId);
+
+            modelBuilder.Entity<UserRole>()
+                .HasOne(ur => ur.Role)
+                .WithMany(r => r.UserRoles)
+                .HasForeignKey(ur => ur.RoleId);
+
+            modelBuilder.Entity<Permission>()
+            .HasMany(p => p.Localizations)
+            .WithOne(pl => pl.Permission)
+            .HasForeignKey(pl => pl.PermissionId);
+
+            // Additional configurations
+
+
+            modelBuilder.Entity<Tenant>()
+                .HasIndex(t => t.Name)
+                .IsUnique();
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Persistence\Repositories\PermissionRepository.cs
+
+using Domain.Entities;
+using Domain.Repositories;
+using Microsoft.EntityFrameworkCore;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Infrastructure.Persistence.Repositories
+{
+    public class PermissionRepository : IPermissionRepository
+    {
+        private readonly AppDbContext _context;
+
+        public PermissionRepository(AppDbContext context)
+        {
+            _context = context;
+        }
+
+     
+        public async Task<Permission> GetByIdAsync(Guid id)
+        {
+            return await _context.Permissions
+                .Include(p => p.Localizations) 
+                .FirstOrDefaultAsync(p => p.Id == id);
+        }
+
+  
+        public async Task<Permission> GetByNameAsync(string name)
+        {
+            return await _context.Permissions
+                .FirstOrDefaultAsync(p => p.Name == name);
+        }
+
+
+        public async Task<PagedResult<Permission>> GetAllAsync(int pageNumber, int pageSize)
+        {
+            var skip = (pageNumber - 1) * pageSize;
+
+            var totalCount = await _context.Permissions.CountAsync();
+
+            var permissions = await _context.Permissions
+                .Include(p => p.Localizations) 
+                .OrderBy(p => p.Name) 
+                .Skip(skip)
+                .Take(pageSize)
+                .ToListAsync();
+
+            return new PagedResult<Permission>(permissions, totalCount, pageNumber, pageSize);
+        }
+
+
+        public async Task AddAsync(Permission permission)
+        {
+            await _context.Permissions.AddAsync(permission);
+            await _context.SaveChangesAsync();
+        }
+
+       
+        public async Task UpdateAsync(Permission permission)
+        {
+            _context.Permissions.Update(permission);
+            await _context.SaveChangesAsync();
+        }
+
+      
+        public async Task DeleteAsync(Guid id)
+        {
+            var permission = await _context.Permissions.FindAsync(id);
+            if (permission != null)
+            {
+                _context.Permissions.Remove(permission);
+                await _context.SaveChangesAsync();
+            }
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Persistence\Repositories\RoleRepository.cs
+
+using Domain.Entities;
+using Domain.Repositories;
+using Microsoft.EntityFrameworkCore;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Infrastructure.Persistence.Repositories
+{
+    public class RoleRepository : IRoleRepository
+    {
+        private readonly AppDbContext _context;
+
+        public RoleRepository(AppDbContext context)
+        {
+            _context = context;
+        }
+        public async Task<PagedResult<Role>> GetAllAsync(int pageNumber, int pageSize)
+        {
+            var skip = (pageNumber - 1) * pageSize;
+
+            var totalCount = await _context.Roles.CountAsync();
+
+            var roles = await _context.Roles
+                .Include(p => p.Localizations)
+                .OrderBy(p => p.NormalizedName)
+                .Skip(skip)
+                .Take(pageSize)
+                .ToListAsync();
+
+            return new PagedResult<Role>(roles, totalCount, pageNumber, pageSize);
+        }
+        public async Task<Role> GetByIdAsync(Guid id)
+        {
+            return await _context?.Roles?.Include(r => r.UserRoles).FirstOrDefaultAsync(r => r.Id == id);
+        }
+
+        public async Task AddAsync(Role role)
+        {
+            await _context.Roles.AddAsync(role);
+            await _context.SaveChangesAsync();
+        }
+
+        public async Task UpdateAsync(Role role)
+        {
+            _context.Roles.Update(role);
+            await _context.SaveChangesAsync();
+        }
+
+        public async Task DeleteAsync(Guid id)
+        {
+            var role = await GetByIdAsync(id);
+            if (role != null)
+            {
+                _context.Roles.Remove(role);
+                await _context.SaveChangesAsync();
+            }
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Persistence\Repositories\TenantRepository.cs
+
+using Domain.Entities;
+using Domain.Repositories;
+using Microsoft.EntityFrameworkCore;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Infrastructure.Persistence.Repositories
+{
+    public class TenantRepository : ITenantRepository
+    {
+        private readonly AppDbContext _context;
+
+        public TenantRepository(AppDbContext context)
+        {
+            _context = context;
+        }
+        public async Task<PagedResult<Tenant>> GetAllAsync(int pageNumber, int pageSize)
+        {
+            var skip = (pageNumber - 1) * pageSize;
+
+            var totalCount = await _context.Tenants.CountAsync();
+
+            var tenants = await _context.Tenants
+                .OrderBy(p => p.Id)
+                .Skip(skip)
+                .Take(pageSize)
+                .ToListAsync();
+
+            return new PagedResult<Tenant>(tenants, totalCount, pageNumber, pageSize);
+        }
+        public async Task<Tenant> GetByIdAsync(Guid tenantId)
+        {
+            return await _context.Tenants.Include(t => t.UserTenants).FirstOrDefaultAsync(t => t.Id == tenantId);
+        }
+
+        public async Task AddAsync(Tenant tenant)
+        {
+            await _context.Tenants.AddAsync(tenant);
+            await _context.SaveChangesAsync();
+        }
+
+        public async Task UpdateAsync(Tenant tenant)
+        {
+            _context.Tenants.Update(tenant);
+            await _context.SaveChangesAsync();
+        }
+
+        public async Task DeleteAsync(Guid id)
+        {
+            var tenant = await GetByIdAsync(id);
+            if (tenant != null)
+            {
+                _context.Tenants.Remove(tenant);
+                await _context.SaveChangesAsync();
+            }
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Persistence\Repositories\UnitOfWork.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Domain.Repositories;
+namespace Infrastructure.Persistence.Repositories
+{
+    public class UnitOfWork : IUnitOfWork
+    {
+        private readonly AppDbContext _context;
+
+        // Repositories
+        public IUserRepository Users { get; }
+        public ITenantRepository Tenants { get; }
+        public IRoleRepository Roles { get; }
+
+        // Save changes to the database
+        public async Task<int> CompleteAsync()
+        {
+            return await _context.SaveChangesAsync();
+        }
+
+        // Dispose the context
+        public void Dispose()
+        {
+            _context.Dispose();
+        }
+    }
+
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Persistence\Repositories\UserRepository.cs
+
+using Domain.Entities;
+using Domain.Repositories;
+using Microsoft.EntityFrameworkCore;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Infrastructure.Persistence.Repositories
+{
+    public class UserRepository : IUserRepository
+    {
+        private readonly AppDbContext _context;
+
+        public UserRepository(AppDbContext context)
+        {
+            _context = context;
+        }
+
+        public async Task<PagedResult<User>> GetAllAsync(int pageNumber, int pageSize)
+        {
+            var skip = (pageNumber - 1) * pageSize;
+
+            var totalCount = await _context.Users.CountAsync();
+
+            var users = await _context.Users
+                .OrderBy(p => p.Id)
+                .Skip(skip)
+                .Take(pageSize)
+                .ToListAsync();
+
+            return new PagedResult<User>(users, totalCount, pageNumber, pageSize);
+        }
+        public async Task AddAsync(User user)
+        {
+            await _context.Users.AddAsync(user);
+            await _context.SaveChangesAsync();
+        }
+
+        public async Task DeleteAsync(Guid id)
+        {
+            var user = await GetByIdAsync(id);
+            if (user != null)
+            {
+                _context.Users.Remove(user);
+                await _context.SaveChangesAsync();
+            }
+        }
+
+        public async Task<User> GetByIdAsync(Guid id)
+        {
+            return await _context.Users.Include(u => u.UserTenants).
+                FirstOrDefaultAsync(u => u.Id == id);
+        }
+
+        public async Task UpdateAsync(User user)
+        {
+            _context.Users.Update(user);
+            await _context.SaveChangesAsync();
+        }
+
+        public async Task<User> GetByUsernameAsync(string username)
+        {
+            return await _context.Users.FirstOrDefaultAsync(u => u.Username == username);
+        }
+
+        public async Task<bool> UserExists(string username, string email)
+        {
+            return await _context.Users.AnyAsync(u => u.Username == username || u.Email.ToString() == email);
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Security\AuthenticationService.cs
+
+using Domain.Entities;
+using Domain.Repositories;
+using Domain.ValueObjects;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Infrastructure.Security
+{
+    public class AuthenticationService
+    {
+        private readonly IUserRepository _userRepository;
+
+        public AuthenticationService(IUserRepository userRepository)
+        {
+            _userRepository = userRepository;
+        }
+
+        public async Task<User> Authenticate(string username, string password)
+        {
+            var user = await _userRepository.GetByUsernameAsync(username);
+            if (user == null || !VerifyPasswordHash(password, user.PasswordHash, user.PasswordSalt))
+                return null;
+
+            return user;
+        }
+
+        public async Task<User> Register(string username, string email, string password)
+        {
+            if (await _userRepository.UserExists(username, email))
+                throw new InvalidOperationException("User already exists.");
+
+            byte[] passwordHash, passwordSalt;
+            User.CreatePasswordHash(password, out passwordHash, out passwordSalt);
+
+            var user = new User(username, new Email(email), passwordHash, passwordSalt);
+            await _userRepository.AddAsync(user);
+
+            return user;
+        }
+
+        private bool VerifyPasswordHash(string password, byte[] storedHash, byte[] storedSalt)
+        {
+            using (var hmac = new System.Security.Cryptography.HMACSHA512(storedSalt))
+            {
+                var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(password));
+                return computedHash.SequenceEqual(storedHash);
+            }
+        }
+
+        public async Task<User> GetUserByUsername(string username)
+        {
+            return await _userRepository.GetByUsernameAsync(username);
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Security\JwtTokenService.cs
+
+using Domain.Entities;
+using Microsoft.IdentityModel.Tokens;
+using System;
+using System.Collections.Generic;
+using System.IdentityModel.Tokens.Jwt;
+using System.Linq;
+using System.Security.Claims;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Infrastructure.Security
+{
+    public class JwtTokenService
+    {
+        private readonly string _secret;
+        private readonly string _issuer;
+        private readonly string _audience;
+        private readonly Dictionary<string, string> _refreshTokens = new Dictionary<string, string>();
+
+        public JwtTokenService(string secret, string issuer, string audience)
+        {
+            _secret = secret;
+            _issuer = issuer;
+            _audience = audience;
+        }
+
+        public string GenerateToken(User user)
+        {
+            var claims = new[]
+            {
+                new Claim(JwtRegisteredClaimNames.Sub, user.Id.ToString()),
+                new Claim(JwtRegisteredClaimNames.UniqueName, user.Username),
+                new Claim(JwtRegisteredClaimNames.Email, user.Email.ToString()),
+                new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
+            };
+
+            var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_secret));
+            var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+            var token = new JwtSecurityToken(
+                issuer: _issuer,
+                audience: _audience,
+                claims: claims,
+                expires: DateTime.Now.AddMinutes(30), // Token expiration time
+                signingCredentials: creds);
+
+            return new JwtSecurityTokenHandler().WriteToken(token);
+        }
+
+        public async Task RevokeToken(string token)
+        {
+            _refreshTokens.Remove(token);
+        }
+
+        public async Task<string> RefreshToken(string token)
+        {
+            if (_refreshTokens.ContainsKey(token))
+            {
+                var userId = _refreshTokens[token];
+                var user = await GetUserById(Guid.Parse(userId));
+                return GenerateToken(user);
+            }
+
+            throw new SecurityTokenException("Invalid token.");
+        }
+
+        private async Task<User> GetUserById(Guid userId)
+        {
+            // Fetch the user from the database or repository
+            return new User(); // Placeholder
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Security\MultiFactorAuthenticationService.cs
+
+using Domain.Entities;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Infrastructure.Security
+{
+    public class MultiFactorAuthenticationService
+    {
+        private readonly Dictionary<string, string> _mfaCodes = new Dictionary<string, string>();
+
+        public async Task SendMfaCode(User user)
+        {
+            var code = GenerateMfaCode();
+            _mfaCodes[user.Username] = code;
+           
+        }
+
+        public bool VerifyMfaCode(User user, string code)
+        {
+            return _mfaCodes.ContainsKey(user.Username) && _mfaCodes[user.Username] == code;
+        }
+
+        private string GenerateMfaCode()
+        {
+            var random = new Random();
+            return random.Next(100000, 999999).ToString();
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Security\SecurityService.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Infrastructure.Security
+{
+    public class SecurityService
+    {
+        public void EncryptSensitiveData(ref string data)
+        {
+            data = Convert.ToBase64String(Encoding.UTF8.GetBytes(data));
+        }
+
+        public void DecryptSensitiveData(ref string data)
+        {
+            data = Encoding.UTF8.GetString(Convert.FromBase64String(data)); 
+        }
+
+        public void LogSecurityEvent(string eventType, string details)
+        {
+            Console.WriteLine($"Security Event: {eventType}, Details: {details}"); 
+        }
+
+        public void EnforceRateLimiting(string key)
+        {
+            
+        }
+
+        public void DetectAndPreventBruteForce(string key)
+        {
+            
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Program.cs
+
+using Application.ApplicationServices;
+using Domain.Repositories;
+
+using Infrastructure.Persistence;
+using Infrastructure.Persistence.Repositories;
+using Infrastructure.Security;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using System.Text;
+
+
+var builder = WebApplication.CreateBuilder(args);
+
+
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+
+builder.Services.AddScoped<IUserRepository, UserRepository>();
+builder.Services.AddScoped<ITenantRepository, TenantRepository>();
+builder.Services.AddScoped<IRoleRepository, RoleRepository>();
+builder.Services.AddScoped<IPermissionRepository, PermissionRepository>();
+builder.Services.AddScoped<IUnitOfWork, UnitOfWork>();
+builder.Services.AddScoped<UserApplicationService>();
+builder.Services.AddScoped<AuthenticationApplicationService>();
+builder.Services.AddScoped<AuthenticationService>();
+builder.Services.AddScoped<TenantApplicationService>();
+builder.Services.AddScoped<TenantApplicationService>();
+builder.Services.AddScoped<RoleApplicationService>();
+builder.Services.AddScoped<UserProfileApplicationService>();
+builder.Services.AddScoped<MultiFactorAuthenticationService>();
+builder.Services.AddScoped<SecurityService>();
+
+
+builder.Services.AddControllers();
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+builder.Services.AddMemoryCache();
+
+
+var jwtSettings = builder.Configuration.GetSection("Jwt");
+var jwtKey = jwtSettings["Key"] ?? throw new InvalidOperationException("JWT Key is missing in configuration.");
+
+builder.Services.AddSingleton(new JwtTokenService(jwtKey, jwtSettings["Issuer"], jwtSettings["Audience"]));
+
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = jwtSettings["Issuer"],
+            ValidAudience = jwtSettings["Audience"],
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey))
+        };
+    });
+
+builder.Services.AddAuthorization();
+
+var app = builder.Build();
+
+
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+app.UseHttpsRedirection();
+app.UseRouting();
+app.UseAuthentication();
+app.UseAuthorization();
+app.MapControllers();
+
+app.Run();
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Authentication\JWT.cs
+
+namespace Presentation.Authentication
+{
+    public class JWT
+{
+        public string Key { get; set; }
+        public string Issuer { get; set; }
+        public string Audience { get; set; }
+        public int AccessTokenExpiration { get; set; }
+
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Authentication\JwtTokenService.cs
+
+using Domain.Entities;
+using Microsoft.IdentityModel.Tokens;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
+
+namespace Presentation.Authentication
+{
+    public class JwtTokenService
+    {
+        private readonly string _secret;
+
+        public JwtTokenService(string secret)
+        {
+            _secret = secret;
+        }
+
+        public string GenerateToken(User user)
+        {
+            var claims = new[]
+            {
+                new Claim(JwtRegisteredClaimNames.Sub, user.Id.ToString()),
+                new Claim(JwtRegisteredClaimNames.UniqueName, user.Username)
+            };
+
+            var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_secret));
+            var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+            var token = new JwtSecurityToken(
+                issuer: "yourdomain.com",
+                audience: "yourdomain.com",
+                claims: claims,
+                expires: DateTime.Now.AddMinutes(30),
+                signingCredentials: creds);
+
+            return new JwtSecurityTokenHandler().WriteToken(token);
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Authorization\AuthorizationAttribute.cs
+
+using Microsoft.AspNetCore.Mvc.Filters;
+using Microsoft.AspNetCore.Mvc;
+
+namespace Presentation.Authorization
+{
+    [AttributeUsage(AttributeTargets.Method | AttributeTargets.Class, AllowMultiple = true)]
+    public class AuthorizeAttribute : Attribute, IAuthorizationFilter
+    {
+        private readonly string[] _requiredPermissions;
+
+        public AuthorizeAttribute(params string[] requiredPermissions)
+        {
+            _requiredPermissions = requiredPermissions;
+        }
+
+        public void OnAuthorization(AuthorizationFilterContext context)
+        {
+            var user = context.HttpContext.User;
+            if (!user.Identity.IsAuthenticated)
+            {
+                context.Result = new UnauthorizedResult();
+                return;
+            }
+
+            var userPermissions = user.Claims.Where(c => c.Type == "permissions").Select(c => c.Value).ToList();
+            if (!_requiredPermissions.All(p => userPermissions.Contains(p)))
+            {
+                context.Result = new ForbidResult();
+            }
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Controllers\AuthenticationController.cs
+
+using Application.ApplicationServices;
+using Application.DTOs;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using System;
+using System.Threading.Tasks;
+
+namespace Presentation.Controllers
+{
+    [Route("[controller]")]
+    [ApiController]
+    public class AuthenticationController : ControllerBase
+    {
+        private readonly AuthenticationApplicationService _authenticationService;
+
+        public AuthenticationController(AuthenticationApplicationService authenticationService)
+        {
+            _authenticationService = authenticationService;
+        }
+
+        [HttpPost]
+        public async Task<ActionResult<BaseResponse<string>>> Login([FromBody] LoginRequest request)
+        {
+            try
+            {
+                var token = await _authenticationService.Login(request.Username, request.Password);
+                return Ok(BaseResponse<string>.SuccessResponse(token, "Login successful"));
+            }
+            catch (InvalidOperationException ex) when (ex.Message == "MFA code required.")
+            {
+                return Ok(BaseResponse<string>.SuccessResponse(null, "MFA code required.", 200));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<string>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+            }
+        }
+
+    
+        [HttpPost]
+        public async Task<ActionResult<BaseResponse<string>>> VerifyMultiFactorAuthentication([FromBody] VerifyMfaRequest request)
+        {
+            try
+            {
+                var token = await _authenticationService.VerifyMfa(request.Username, request.MfaCode);
+                return Ok(BaseResponse<string>.SuccessResponse(token, "MFA verification successful"));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<string>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+            }
+        }
+
+ 
+        [HttpPost]
+        public async Task<ActionResult<BaseResponse<string>>> Register([FromBody] RegisterRequest request)
+        {
+            try
+            {
+                var token = await _authenticationService.Register(request.Username, request.Email, request.Password);
+                return Ok(BaseResponse<string>.SuccessResponse(token, "Registration successful", 201));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<string>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+            }
+        }
+
+   
+        [HttpPost]
+        public async Task<ActionResult<BaseResponse<object>>> RevokeToken([FromBody] RevokeTokenRequest request)
+        {
+            try
+            {
+                await _authenticationService.RevokeToken(request.Token);
+                return Ok(BaseResponse<object>.SuccessResponse(null, "Token revoked successfully"));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+            }
+        }
+
+      
+        [HttpPost()]
+        public async Task<ActionResult<BaseResponse<string>>> RefreshToken([FromBody] RefreshTokenRequest request)
+        {
+            try
+            {
+                var token = await _authenticationService.RefreshToken(request.Token);
+                return Ok(BaseResponse<string>.SuccessResponse(token, "Token refreshed successfully"));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<string>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+            }
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Controllers\PermissionsController.cs
+
+using Microsoft.AspNetCore.Mvc;
+using System;
+using System.Threading.Tasks;
+using Domain.Entities;
+using Application.ApplicationServices;
+using Application.DTOs;
+using SharedDomain.Common;
+
+[ApiController]
+[Route("api/[controller]")]
+public class PermissionsController : ControllerBase
+{
+    private readonly PermissionApplicationService _permissionService;
+
+    public PermissionsController(PermissionApplicationService permissionService)
+    {
+        _permissionService = permissionService;
+    }
+
+  
+    [HttpGet]
+    public async Task<ActionResult<BaseResponse<PagedResult<Permission>>>> GetPermissions(int pageNumber = 1, int pageSize = 10)
+    {
+        try
+        {
+            var result = await _permissionService.GetPermissionsPaginatedAsync(pageNumber, pageSize);
+            return Ok(BaseResponse<PagedResult<Permission>>.SuccessResponse(result, "Permissions retrieved successfully"));
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, BaseResponse<PagedResult<Permission>>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+        }
+    }
+
+
+    [HttpGet("{id}")]
+    public async Task<ActionResult<BaseResponse<Permission>>> GetPermission(Guid id)
+    {
+        try
+        {
+            var permission = await _permissionService.GetPermissionByIdAsync(id);
+            if (permission == null)
+            {
+                return NotFound(BaseResponse<Permission>.ErrorResponse("Permission not found", 404));
+            }
+            return Ok(BaseResponse<Permission>.SuccessResponse(permission, "Permission retrieved successfully"));
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, BaseResponse<Permission>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+        }
+    }
+
+  
+    [HttpPost]
+    public async Task<ActionResult<BaseResponse<Permission>>> CreatePermission([FromBody] CreatePermissionRequest request)
+    {
+        try
+        {
+            if (!ModelState.IsValid)
+            {
+                return BadRequest(BaseResponse<Permission>.ErrorResponse("Invalid input", 400));
+            }
+
+            var permission = await _permissionService.CreatePermissionAsync(request.Name, request.UserType);
+            return CreatedAtAction(nameof(GetPermission), new { id = permission.Id }, BaseResponse<Permission>.SuccessResponse(permission, "Permission created successfully", 201));
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, BaseResponse<Permission>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+        }
+    }
+
+   
+    [HttpPut("{id}")]
+    public async Task<ActionResult<BaseResponse<object>>> UpdatePermission(Guid id, [FromBody] UpdatePermissionRequest request)
+    {
+        try
+        {
+            if (!ModelState.IsValid)
+            {
+                return BadRequest(BaseResponse<object>.ErrorResponse("Invalid input", 400));
+            }
+
+            var permission = await _permissionService.GetPermissionByIdAsync(id);
+            if (permission == null)
+            {
+                return NotFound(BaseResponse<object>.ErrorResponse("Permission not found", 404));
+            }
+
+            permission.Name = request.Name;
+            permission.UserType = request.UserType;
+
+            await _permissionService.UpdatePermissionAsync(permission);
+            return Ok(BaseResponse<object>.SuccessResponse(null, "Permission updated successfully"));
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, BaseResponse<object>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+        }
+    }
+
+
+    [HttpDelete("{id}")]
+    public async Task<ActionResult<BaseResponse<object>>> DeletePermission(Guid id)
+    {
+        try
+        {
+            var permission = await _permissionService.GetPermissionByIdAsync(id);
+            if (permission == null)
+            {
+                return NotFound(BaseResponse<object>.ErrorResponse("Permission not found", 404));
+            }
+
+            await _permissionService.DeletePermissionAsync(id);
+            return Ok(BaseResponse<object>.SuccessResponse(null, "Permission deleted successfully"));
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, BaseResponse<object>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Controllers\RoleController.cs
+
+using Application.ApplicationServices;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using System;
+using System.Threading.Tasks;
+using Application.DTOs;
+using SharedDomain.Common;
+using Domain.Entities;
+
+namespace Presentation.Controllers
+{
+    [Route("[controller]")]
+    [ApiController]
+    public class RoleController : ControllerBase
+    {
+        private readonly RoleApplicationService _roleApplicationService;
+
+        public RoleController(RoleApplicationService roleApplicationService)
+        {
+            _roleApplicationService = roleApplicationService;
+        }
+
+      
+        [HttpGet]
+        public async Task<ActionResult<BaseResponse<PagedResult<Role>>>> GetRoles(int pageNumber = 1, int pageSize = 10)
+        {
+            try
+            {
+                var result = await _roleApplicationService.GetRolesPaginatedAsync(pageNumber, pageSize);
+                return Ok(BaseResponse<PagedResult<Role>>.SuccessResponse(result, "Roles retrieved successfully"));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<PagedResult<Role>>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+            }
+        }
+
+
+        [HttpPost]
+        public async Task<ActionResult<BaseResponse<object>>> Create([FromBody] CreateRoleRequest request)
+        {
+            try
+            {
+                await _roleApplicationService.CreateRole(request.TenantId, request.RoleName, request.UserType, request.isSystem, request.Permissions, request.localizations);
+                return Ok(BaseResponse<object>.SuccessResponse(null, "Role created successfully"));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+            }
+        }
+
+       
+        [HttpPut]
+        public async Task<ActionResult<BaseResponse<object>>> Update([FromBody] UpdateRolePermissionsRequest request)
+        {
+            try
+            {
+                await _roleApplicationService.UpdateRolePermissions(request.RoleId, request.Permissions);
+                return Ok(BaseResponse<object>.SuccessResponse(null, "Role permissions updated successfully"));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+            }
+        }
+
+      
+        [HttpDelete]
+        public async Task<ActionResult<BaseResponse<object>>> Delete([FromBody] DeleteRoleRequest request)
+        {
+            try
+            {
+                await _roleApplicationService.DeleteRole(request.RoleId);
+                return Ok(BaseResponse<object>.SuccessResponse(null, "Role deleted successfully"));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+            }
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Controllers\TenantController.cs
+
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Application.ApplicationServices;
+using Application.DTOs;
+using SharedDomain.Common;
+using Domain.Entities;
+using System;
+using System.Threading.Tasks;
+
+namespace Presentation.Controllers
+{
+    [ApiController]
+    [Route("[controller]")]
+    public class TenantController : ControllerBase
+    {
+        private readonly TenantApplicationService _tenantApplicationService;
+
+        public TenantController(TenantApplicationService tenantApplicationService)
+        {
+            _tenantApplicationService = tenantApplicationService;
+        }
+
+     
+        [HttpGet]
+        public async Task<ActionResult<BaseResponse<PagedResult<Tenant>>>> GetTenants(int pageNumber = 1, int pageSize = 10)
+        {
+            try
+            {
+                var result = await _tenantApplicationService.GetTenatsPaginatedAsync(pageNumber, pageSize);
+                return Ok(BaseResponse<PagedResult<Tenant>>.SuccessResponse(result, "Tenants retrieved successfully"));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<PagedResult<Tenant>>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+            }
+        }
+
+      
+        [HttpPost]
+        public async Task<ActionResult<BaseResponse<object>>> Create([FromBody] CreateTenantRequest request)
+        {
+            try
+            {
+                await _tenantApplicationService.CreateTenant(request);
+                return Ok(BaseResponse<object>.SuccessResponse(null, "Tenant created successfully"));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+            }
+        }
+
+        [HttpPut]
+        public async Task<ActionResult<BaseResponse<object>>> Update([FromBody] UpdateTenantRequest request)
+        {
+            try
+            {
+                await _tenantApplicationService.UpdateTenant(request);
+                return Ok(BaseResponse<object>.SuccessResponse(null, "Tenant updated successfully"));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+            }
+        }
+
+   
+        [HttpDelete]
+        public async Task<ActionResult<BaseResponse<object>>> Delete([FromBody] DeleteTenantRequest request)
+        {
+            try
+            {
+                await _tenantApplicationService.DeleteTenant(request);
+                return Ok(BaseResponse<object>.SuccessResponse(null, "Tenant deleted successfully"));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+            }
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Controllers\UserProfileController.cs
+
+using Application.ApplicationServices;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using System;
+using System.Threading.Tasks;
+using Application.DTOs;
+using SharedDomain.Common;
+
+namespace Presentation.Controllers
+{
+    [Route("[controller]")]
+    [ApiController]
+    public class UserProfileController : ControllerBase
+    {
+        private readonly UserProfileApplicationService _userProfileApplicationService;
+
+        public UserProfileController(UserProfileApplicationService userProfileApplicationService)
+        {
+            _userProfileApplicationService = userProfileApplicationService;
+        }
+
+     
+        [HttpPut]
+        public async Task<ActionResult<BaseResponse<object>>> UpdateProfile([FromBody] UpdateUserProfileRequest request)
+        {
+            try
+            {
+                await _userProfileApplicationService.UpdateUserProfile(request.UserId, request.NewEmail, request.NewUsername);
+                return Ok(BaseResponse<object>.SuccessResponse(null, "User profile updated successfully"));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+            }
+        }
+
+   
+        [HttpPut]
+        public async Task<ActionResult<BaseResponse<object>>> UpdatePassword([FromBody] UpdatePasswordRequest request)
+        {
+            try
+            {
+                await _userProfileApplicationService.UpdatePassword(request.UserId, request.NewPassword);
+                return Ok(BaseResponse<object>.SuccessResponse(null, "Password updated successfully"));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+            }
+        }
+
+    
+        [HttpPut]
+        public async Task<ActionResult<BaseResponse<object>>> EnableMultiFactorAuthentication([FromBody] EnableMultiFactorAuthenticationRequest request)
+        {
+            try
+            {
+                await _userProfileApplicationService.EnableMultiFactorAuthentication(request.UserId, request.SecretKey);
+                return Ok(BaseResponse<object>.SuccessResponse(null, "Multi-factor authentication enabled successfully"));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+            }
+        }
+
+   
+        [HttpPut]
+        public async Task<ActionResult<BaseResponse<object>>> DisableMultiFactorAuthentication([FromBody] DisableMultiFactorAuthenticationRequest request)
+        {
+            try
+            {
+                await _userProfileApplicationService.DisableMultiFactorAuthentication(request.UserId);
+                return Ok(BaseResponse<object>.SuccessResponse(null, "Multi-factor authentication disabled successfully"));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"Internal server error: {ex.Message}", 500));
+            }
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\DTOs\CreateTenantResponse.cs
+
+namespace Presentation.DTOs
+{
+    public class CreateTenantResponse
+    {
+        public string TenantId { get; set; }
+        public string TenantName { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\DTOs\RegisterUserResponse.cs
+
+namespace Presentation.DTOs
+{
+    public class RegisterUserResponse
+    {
+        public required string UserId { get; set; }
+        public required string Username { get; set; }
+        public required string Email { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Models\TenantModel.cs
+
+namespace Presentation.Models
+{
+    public class TenantModel
+    {
+        public string TenantId { get; set; }
+        public string TenantName { get; set; }
+        public List<UserModel> Users { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Models\UserModel.cs
+
+namespace Presentation.Models
+{
+    public class UserModel
+    {
+        public string UserId { get; set; }
+        public string Username { get; set; }
+        public string Email { get; set; }
+        public List<TenantModel> Tenants { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\SharedDomainLayer\Common\BaseEntity.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace SharedDomain.Common
+{
+    public abstract class BaseEntity
+    {
+        public Guid Id { get;protected set; }
+
+        public DateTime CreatedAt { get;protected set; }
+        public DateTime UpdatedAt { get;protected set; }
+        public string CreatedBy   { get; protected set; }
+        public string UpdatedBy   { get; protected set; }
+        public bool IsDeleted { get; set; } = false;
+        protected BaseEntity() { 
+            Id= Guid.NewGuid();
+        }
+        
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\SharedDomainLayer\Common\BaseResponse.cs
+
+public class BaseResponse<T>
+{
+    public bool Success { get; set; } 
+    public string Message { get; set; }
+    public T Data { get; set; } 
+    public int StatusCode { get; set; } 
+
+    public BaseResponse(bool success, string message, T data, int statusCode)
+    {
+        Success = success;
+        Message = message;
+        Data = data;
+        StatusCode = statusCode;
+    }
+
+    
+    public static BaseResponse<T> SuccessResponse(T data, string message = "Operation successful", int statusCode = 200)
+    {
+        return new BaseResponse<T>(true, message, data, statusCode);
+    }
+
+  
+    public static BaseResponse<T> ErrorResponse(string message, int statusCode = 500, T data = default)
+    {
+        return new BaseResponse<T>(false, message, data, statusCode);
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\SharedDomainLayer\Common\IAggregateRoot.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace SharedDomain.Common
+{
+    public interface IAggregateRoot
+    {
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\SharedDomainLayer\Common\PagedResult.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace SharedDomain.Common
+{
+    public class PagedResult<T>
+    {
+        public List<T> Items { get; set; } 
+        public int TotalCount { get; set; } 
+        public int PageNumber { get; set; }
+        public int PageSize { get; set; }
+        public int TotalPages => (int)Math.Ceiling(TotalCount / (double)PageSize); 
+
+        public PagedResult(List<T> items, int totalCount, int pageNumber, int pageSize)
+        {
+            Items = items;
+            TotalCount = totalCount;
+            PageNumber = pageNumber;
+            PageSize = pageSize;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
