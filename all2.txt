@@ -1,0 +1,5158 @@
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\ApplicationServices\AuthenticationApplicationService.cs
+
+using Application.DTOs;
+using Domain.Entities;
+using Domain.ValueObjects;
+using Infrastructure.Security;
+using Microsoft.EntityFrameworkCore;
+using SharedDomain.Common;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using UnitOfWork;
+using UnitOfWork.Repositories;
+
+namespace Application.ApplicationServices
+{
+    public class AuthenticationApplicationService
+    {
+        private readonly AuthenticationService _authenticationService;
+        private readonly JwtTokenService _jwtTokenService;
+        private readonly MultiFactorAuthenticationService _multiFactorAuthenticationService;
+        private readonly ISmsProvider _smsProvider;
+        private readonly IEmailProvider _emailProvider; 
+
+        private readonly IUnitOfWork _unitOfWork;
+        private readonly ConcurrentDictionary<string, (string Code, DateTime Expiry)> _verificationCodes = new ConcurrentDictionary<string, (string, DateTime)>();
+
+        private IWriteRepository<User> _userWriteRepository => _unitOfWork.GetWriteRepository<User>();
+        private IReadRepository<User> _userReadRepository => _unitOfWork.GetReadRepository<User>();
+        private IReadRepository<Role> _roleReadRepository => _unitOfWork.GetReadRepository<Role>();
+        private IWriteRepository<UserRole> _userRoleWriteRepository => _unitOfWork.GetWriteRepository<UserRole>();
+      
+
+
+
+        public AuthenticationApplicationService(AuthenticationService authenticationService,
+            JwtTokenService jwtTokenService, 
+            MultiFactorAuthenticationService multiFactorAuthenticationService, 
+            ISmsProvider smsProvider, IUnitOfWork unitOfWork, IEmailProvider emailProvider)
+        {
+            _authenticationService = authenticationService;
+            _jwtTokenService = jwtTokenService;
+            _multiFactorAuthenticationService = multiFactorAuthenticationService;
+            _smsProvider = smsProvider; 
+            _unitOfWork = unitOfWork;
+            _emailProvider=emailProvider;
+        }
+      public async Task<SharedDomain.Common.BaseResponse<LoginResponseDTO>> Login(LoginDTO loginDTO ,bool isOTPVerify=false)
+        {
+            var response = new SharedDomain.Common.BaseResponse<LoginResponseDTO>();
+
+            try
+            {
+
+             var user = await _userReadRepository.AsQueryable()
+                .Include(u => u.RefreshTokens)
+                .Include(u => u.UserClients)
+                .FirstOrDefaultAsync(u => (u.Username == loginDTO.Username) && !u.IsDeleted);
+            
+                if (user == null)
+            {
+                response.ResponseCode = 401; 
+                response.ResponseMessage = "Invalid credentials.";
+                return response;
+            }
+
+
+            if (user!=null )
+            {
+                if (InputValidator.IsPhoneNumber(loginDTO.Username) && !isOTPVerify)
+                {
+                    var otpService = new OtpService(_smsProvider, _emailProvider, _unitOfWork);
+                    var otp = await otpService.GenerateOtpAsync(user);
+                    response.ResponseCode = 200;
+                    response.ResponseMessage = $"Your OTP is {otp}. Please verify to proceed.";
+                    response.ResponseData = null;
+                    return response;
+                }
+                if (InputValidator.IsEmail(loginDTO.Username) && !_authenticationService.verifyPasswoed(user, loginDTO.Password))
+                {
+                    response.ResponseCode = 401; 
+                    response.ResponseMessage = "Invalid email or password. Please try again.";
+                    response.ResponseData = null;
+                    return response;
+                }
+
+                    if (InputValidator.IsEmail(loginDTO.Username) && !user.IsEmailVerified)
+                    {
+                        response.ResponseCode = 403;
+                        response.ResponseMessage = "Email is not verified.";
+                        return response;
+                    }
+
+                    if (InputValidator.IsPhoneNumber(loginDTO.Username) && !user.IsPhoneVerified)
+                    {
+
+                        response.ResponseCode = 403;
+                        response.ResponseMessage = "Phone number is not verified.";
+                        return response;
+                    }
+
+                    if (user.IsMfaEnabled)
+                    {
+                        var code = GenerateVerificationCode();
+                        await _smsProvider.SendVerificationCodeAsync(loginDTO.Username, code);
+                        response.ResponseCode = 200;
+                        response.ResponseMessage = "MFA code required.";
+                        return response;
+                    }
+                }
+
+
+
+                if (!user.UserDevices.Any(d => d.DeviceId == loginDTO.DeviceId))
+                {
+                    user.AddDevice(loginDTO.DeviceToken, loginDTO.DeviceId);
+                }
+
+           
+                if (!user.UserClients.Any(c => c.ClientId == loginDTO.ClientId))
+                {
+                    user.AddClient(loginDTO.ClientId, loginDTO.ClientSecret);
+                }
+                Console.WriteLine($"User refresh tokens count: {user.RefreshTokens.Count.ToString()}");
+
+                var token = _jwtTokenService.GenerateToken(user);
+                var refreshToken = await  _jwtTokenService.GenerateRefreshToken(user);
+
+                Console.WriteLine($"User refresh tokens count: {user.RefreshTokens.Count.ToString()}");
+                
+                _userWriteRepository.Attach(user);
+                _userWriteRepository.Update(user);
+                await _unitOfWork.CompleteAsync();
+                Console.WriteLine($"User refresh tokens count: {user.RefreshTokens.Count.ToString()}");
+
+
+                var loginResponse = new LoginResponseDTO
+                {
+                    AccessToken = token,
+                    RefreshToken = refreshToken,
+                    TokenExpiration = DateTime.UtcNow.AddMinutes(30),
+                    RefreshTokenExpiration = DateTime.UtcNow.AddDays(7),
+                    Name = user.Name,
+                    UserName = user.Username,
+                    CompanyName = user.CompanyName,
+                    CompanyUniqueName = user.CompanyUniqueName,
+                    Image = user.Image,
+                    Roles = user.UserRoles.Select(ur => ur.Role.NormalizedName).ToList(), 
+                    UserType = user.UserType,
+                    UserBusinessType = user.UserBusinessType,
+                    UserID = user.Id.ToString(),
+                    IsEmailVerify = user.IsEmailVerified,
+                    IsUserProfileCompleted = user.IsUserProfileCompleted,
+                    IsCompanyProfileCompleted = user.IsCompanyProfileCompleted,
+                    IsCompanyApproved = user.IsCompanyApproved,
+                    TenantId = user.TenantId,
+                    CountryCode = user.CountryCode,
+                    PhoneNumber = user.PhoneNumber?.Value,
+                    IsTravelShopOwner = user.IsTravelShopOwner
+                };
+
+                response.ResponseCode = 200;
+                response.ResponseMessage = "Login successful.";
+                response.ResponseData = loginResponse;
+                response.InternalCode = 0;
+            }
+            catch (Exception ex)
+            {
+                response.ResponseCode = 500;
+                response.ResponseMessage = ex.Message;
+            }
+
+            return response;
+        }
+        public async Task<BaseResponse<string>> Logout(LogoutDTO logoutDTO)
+        {
+            var response = new BaseResponse<string>();
+
+            try
+            {
+                var user = await _userReadRepository.AsQueryable()
+                    .Include(u => u.UserDevices)
+                    .Include(u => u.RefreshTokens) 
+                    .FirstOrDefaultAsync(u => u.UserDevices.Any(d => d.DeviceId == logoutDTO.DeviceID));
+
+                if (user == null)
+                {
+                    response.ResponseCode = 404; 
+                    response.ResponseMessage = "User not found.";
+                    return response;
+                }
+
+                user.RemoveDevice(logoutDTO.DeviceID);
+                user.RemoveClient(logoutDTO.ClientId);
+
+                var refreshToken = await _userReadRepository
+                    .AsQueryable()
+                    .Where(u => u.Id == user.Id) 
+                    .SelectMany(u => u.RefreshTokens) 
+                    .FirstOrDefaultAsync(rt => rt.IsActive && !rt.IsExpired);
+
+                if (refreshToken != null)
+                {
+                    refreshToken.Revoke();
+                    _userWriteRepository.Update(user);
+                    await _unitOfWork.CompleteAsync();
+                }
+
+                response.ResponseCode = 200;
+                response.ResponseMessage = "Logout successful.";
+            }
+            catch (Exception ex)
+            {
+                response.ResponseCode = 500;
+                response.ResponseMessage = ex.Message;
+            }
+
+            return response;
+        }
+
+        public async Task SeedAdminUser()
+        {
+          
+            string adminEmail = "admin@estabdlha.com";
+            string adminPassword = "Admin@123";
+
+           
+            var existingAdminUser = await _userReadRepository.AsQueryable()
+                .FirstOrDefaultAsync(u => u.Email.Value == adminEmail);
+
+            if (existingAdminUser != null)
+            {
+                Console.WriteLine("Admin already exists.");
+                return;
+            }
+
+            var adminUser = UserFactory.CreateUser(adminEmail, adminPassword);
+            await _userWriteRepository.AddAsync(adminUser);
+            await _unitOfWork.CompleteAsync();
+
+            var adminRole = await _roleReadRepository.AsQueryable()
+                .FirstOrDefaultAsync(r => r.NormalizedName == "Admin");
+
+            if (adminRole != null)
+            {
+                var userRole = new UserRole(adminUser.Id, adminRole.Id, Guid.NewGuid());
+                await _userRoleWriteRepository.AddAsync(userRole);
+                await _unitOfWork.CompleteAsync();
+            }
+            
+        }
+        public async Task<string> VerifyMfa(string identifier, string mfaCode)
+        {
+            var user = await _authenticationService.GetUserByIdentifier(identifier);
+            if (user == null || !_multiFactorAuthenticationService.VerifyMfaCode(user, mfaCode))
+                throw new UnauthorizedAccessException("Invalid MFA code.");
+
+            return _jwtTokenService.GenerateToken(user);
+        }
+
+
+        public async Task<BaseResponse<string>> Register(string username)
+        {
+            var response = new BaseResponse<string>();
+
+            try
+            {
+               
+                var userExists = await _userReadRepository.AsQueryable()
+                    .AnyAsync(u => (u.Username == username || u.Email.Value == username) && !u.IsDeleted);
+
+                if (userExists)
+                {
+                    response.ResponseCode = 400;
+                    response.ResponseMessage = "User already exists.";
+                    return response;
+                }
+
+                var user = UserFactory.CreateUser(username);
+                await _userWriteRepository.AddAsync(user);
+                await _unitOfWork.CompleteAsync();
+
+                var otpService = new OtpService(_smsProvider, _emailProvider, _unitOfWork);
+                var otp = await otpService.GenerateOtpAsync(user);
+               
+                response.ResponseCode = 200;
+                response.ResponseMessage = "OTP sent successfully.";
+                response.ResponseData = otp;
+                return response;
+            }
+            catch (Exception ex)
+            {
+                response.ResponseCode = 500;
+                response.ResponseMessage = ex.Message;
+                return response;
+            }
+        }
+        public async Task<BaseResponse<LoginResponseDTO>> VerifyOtp(string username, string otp, LoginDTO loginDTO)
+        {
+            var response = new BaseResponse<LoginResponseDTO>();
+
+            try
+            {
+               
+                var otpService = new OtpService(_smsProvider, _emailProvider, _unitOfWork);
+                var isVerified = await otpService.VerifyOtpAsync(username, otp);
+
+                if (!isVerified)
+                {
+                    response.ResponseCode = 400;
+                    response.ResponseMessage = "Invalid OTP.";
+                    return response;
+                }
+
+               if(InputValidator.IsEmail(username) && (loginDTO.Password==null || loginDTO.Password =="") )
+                {
+                    response.ResponseCode = 400;
+                    response.ResponseMessage = "Enter your Password";
+                    return response;
+                }
+
+                
+                var loginResponse = await Login(loginDTO,true);
+
+                return loginResponse;
+            }
+            catch (Exception ex)
+            {
+                response.ResponseCode = 500;
+                response.ResponseMessage = ex.Message;
+                return response;
+            }
+        }
+
+        private string GenerateVerificationCode()
+        {
+            var random = new Random();
+            return random.Next(100000, 999999).ToString();
+        }
+
+        public async Task RevokeToken(string token)
+        {
+            await _jwtTokenService.RevokeToken(token);
+        }
+
+        public async Task<BaseResponse<LoginResponseDTO>> RefreshToken(RefreshTokenDTO refreshTokenDTO)
+        {
+            var response = new BaseResponse<LoginResponseDTO>();
+
+            try
+            {
+                var refreshToken = await _userReadRepository
+                    .AsQueryable()
+                    .Where(u => u.RefreshTokens.Any(rt => rt.Token == refreshTokenDTO.RefreshToken && !rt.IsRevoked&& rt.Expires > DateTime.UtcNow))
+                    .SelectMany(u => u.RefreshTokens)
+                    .FirstOrDefaultAsync();
+
+                if (refreshToken == null)
+                {
+                    response.ResponseCode = 401; 
+                    response.ResponseMessage = "Invalid or expired refresh token.";
+                    return response;
+                }
+
+                var user = await _userReadRepository
+                    .AsQueryable()
+                    .Include(u => u.UserClients)
+                    .FirstOrDefaultAsync(u => u.Id == refreshToken.UserId);
+
+                if (user == null || !user.UserClients.Any(c => c.ClientId == refreshTokenDTO.ClientId && c.ClientSecret == refreshTokenDTO.ClientSecret))
+                {
+                    response.ResponseCode = 401; 
+                    response.ResponseMessage = "Invalid client ID or secret.";
+                    return response;
+                }
+
+                var newAccessToken = _jwtTokenService.GenerateToken(user);
+                var newRefreshToken = await _jwtTokenService.GenerateRefreshToken(user);
+
+                refreshToken.Revoke();
+                _userWriteRepository.Update(user);
+                await _unitOfWork.CompleteAsync();
+
+                var loginResponse = new LoginResponseDTO
+                {
+                    AccessToken = newAccessToken,
+                    RefreshToken = newRefreshToken,
+                    TokenExpiration = DateTime.UtcNow.AddMinutes(30), 
+                    RefreshTokenExpiration = DateTime.UtcNow.AddDays(7), 
+                    Name = user.Name,
+                    UserName = user.Username,
+                    CompanyName = user.CompanyName,
+                    CompanyUniqueName = user.CompanyUniqueName,
+                    Image = user.Image,
+                    Roles = user.UserRoles.Select(ur => ur.Role.NormalizedName).ToList(),
+                    UserType = user.UserType,
+                    UserBusinessType = user.UserBusinessType,
+                    UserID = user.Id.ToString(),
+                    IsEmailVerify = user.IsEmailVerified,
+                    IsUserProfileCompleted = user.IsUserProfileCompleted,
+                    IsCompanyProfileCompleted = user.IsCompanyProfileCompleted,
+                    IsCompanyApproved = user.IsCompanyApproved,
+                    TenantId = user.TenantId,
+                    CountryCode = user.CountryCode,
+                    PhoneNumber = user.PhoneNumber?.Value,
+                    IsTravelShopOwner = user.IsTravelShopOwner
+                };
+
+                response.ResponseCode = 200;
+                response.ResponseMessage = "Token refreshed successfully.";
+                response.ResponseData = loginResponse;
+            }
+            catch (Exception ex)
+            {
+                response.ResponseCode = 500;
+                response.ResponseMessage = ex.Message;
+            }
+
+            return response;
+        }
+        public async Task<string> SendVerificationCodeAsync(string identifier)
+        {
+            if (!InputValidator.IsEmail(identifier) && !InputValidator.IsPhoneNumber(identifier))
+                throw new ArgumentException("Invalid identifier. Please provide a valid email or phone number.");
+
+            var userReadRepository = _unitOfWork.GetReadRepository<User>();
+            var user = await userReadRepository.AsQueryable()
+                .FirstOrDefaultAsync(u => u.Username == identifier || u.Email.Value == identifier);
+
+            if (user == null)
+                throw new Exception("User not found.");
+
+            var code = GenerateVerificationCode();
+            var expiry = DateTime.UtcNow.AddMinutes(5); 
+            user.SetVerificationCode(code, expiry); 
+
+            var userWriteRepository = _unitOfWork.GetWriteRepository<User>();
+            userWriteRepository.Update(user);
+            await _unitOfWork.CompleteAsync();
+
+            if (InputValidator.IsEmail(identifier))
+            {
+                await _emailProvider.SendVerificationCodeAsync(identifier, code); 
+            }
+            else if (InputValidator.IsPhoneNumber(identifier))
+            {
+                await _smsProvider.SendVerificationCodeAsync(identifier, code); 
+            }
+
+            return code; 
+        }
+
+      
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\ApplicationServices\OtpService.cs
+
+
+using Application.DTOs;
+using Domain.Entities;
+using Infrastructure.Security;
+using Microsoft.EntityFrameworkCore;
+using SharedDomain.Common;
+using UnitOfWork;
+using UnitOfWork.Repositories;
+
+
+namespace Application.ApplicationServices
+{
+    public class OtpService
+    {
+        private readonly ISmsProvider _smsProvider;
+        private readonly IEmailProvider _emailProvider;
+        private readonly IUnitOfWork _unitOfWork;
+
+        private IReadRepository<User> _userReadRepository => _unitOfWork.GetReadRepository<User>();
+
+        public OtpService(ISmsProvider smsProvider, IEmailProvider emailProvider, IUnitOfWork unitOfWork)
+        {
+            _smsProvider = smsProvider;
+            _emailProvider = emailProvider;
+            _unitOfWork = unitOfWork;
+        }
+        public async Task<string> GenerateOtpByUsenName(string UserName)
+        {
+                var user = _userReadRepository.AsQueryable()
+                  .FirstOrDefaultAsync(u => (u.Username == UserName) && !u.IsDeleted)
+                  .Result;
+
+                var res = await GenerateOtpAsync(user);
+
+                return res;
+            
+        }
+        public async Task<string> GenerateOtpAsync(User user)
+        {
+            try
+            {
+                
+                if (!InputValidator.IsEmail(user.Username) && !InputValidator.IsPhoneNumber(user.Username))
+                    throw new ArgumentException("Invalid username. Please provide a valid email or phone number.");
+
+                
+                var otp = GenerateOtp();
+
+               
+                if (InputValidator.IsEmail(user.Username))
+                {
+                    await _emailProvider.SendVerificationCodeAsync(user.Username, otp);
+                }
+                else if (InputValidator.IsPhoneNumber(user.Username))
+                {
+                    await _smsProvider.SendVerificationCodeAsync(user.Username, otp);
+                }
+
+                var userReadRepository = _unitOfWork.GetReadRepository<User>();
+
+                user.SetVerificationCode(otp, DateTime.UtcNow.AddMinutes(5));
+                var userWriteRepository = _unitOfWork.GetWriteRepository<User>();
+                userWriteRepository.Update(user);
+                await _unitOfWork.CompleteAsync();
+                
+                return otp;
+            }
+            catch (Exception ex)
+            {
+                // Log the error and rethrow
+                throw new Exception("Failed to generate or send OTP.", ex);
+            }
+        }
+
+ 
+
+        public async Task<bool> VerifyOtpAsync(string identifier, string otp)
+        {
+            if (!InputValidator.IsEmail(identifier) && !InputValidator.IsPhoneNumber(identifier))
+                throw new ArgumentException("Invalid identifier. Please provide a valid email or phone number.");
+
+            var userReadRepository = _unitOfWork.GetReadRepository<User>();
+            var user = await userReadRepository.AsQueryable()
+                .FirstOrDefaultAsync(u => u.Username == identifier || u.Email.Value == identifier);
+
+
+           
+            if (user.VerificationCode == otp && user.VerificationCodeExpiry > DateTime.UtcNow)
+            {
+                if (InputValidator.IsEmail(identifier))
+                {
+                    user.MarkEmailAsVerified();
+                }
+                else if (InputValidator.IsPhoneNumber(identifier))
+                {
+                    user.MarkPhoneAsVerified();
+                }
+
+
+                user.SetVerificationCode(null, DateTime.UtcNow);
+
+                var userWriteRepository = _unitOfWork.GetWriteRepository<User>();
+                userWriteRepository.Update(user);
+                await _unitOfWork.CompleteAsync();
+
+                userReadRepository.Detach(user);
+
+                return true;
+            }
+
+            return false;
+        }
+
+
+        private string GenerateOtp()
+        {
+            var random = new Random();
+            return random.Next(100000, 999999).ToString(); 
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\ApplicationServices\PermissionApplicationService.cs
+
+using Domain.Entities;
+using Microsoft.EntityFrameworkCore;
+using SharedDomain.Common;
+using UnitOfWork;
+using UnitOfWork.Repositories;
+
+public class PermissionApplicationService
+{
+    private readonly IUnitOfWork _unitOfWork;
+
+    public PermissionApplicationService(IUnitOfWork unitOfWork)
+    {
+        _unitOfWork = unitOfWork;
+    }
+
+    private IReadRepository<Permission> _permissionReadRepository => _unitOfWork.GetReadRepository<Permission>();
+    private IWriteRepository<Permission> _permissionWriteRepository => _unitOfWork.GetWriteRepository<Permission>();
+
+    public async Task<PagedResult<Permission>> GetPermissionsPaginatedAsync(int pageNumber, int pageSize)
+    {
+        var skip = (pageNumber - 1) * pageSize;
+        var totalCount = await _permissionReadRepository.AsQueryable().CountAsync();
+        var permissions = await _permissionReadRepository.AsQueryable()
+            .OrderBy(p => p.Name)
+            .Skip(skip)
+            .Take(pageSize)
+            .ToListAsync();
+
+        return new PagedResult<Permission>(permissions, totalCount, pageNumber, pageSize);
+    }
+
+    public async Task<Permission> CreatePermissionAsync(string name, string userType)
+    {
+        var permission = new Permission(name, userType);
+        await _permissionWriteRepository.AddAsync(permission);
+        await _unitOfWork.CompleteAsync();
+        return permission;
+    }
+
+    public async Task<Permission> GetPermissionByNameAsync(string name)
+    {
+        return await _permissionReadRepository.AsQueryable().FirstOrDefaultAsync(p => p.Name == name);
+    }
+
+    public async Task<Permission> GetPermissionByIdAsync(Guid id)
+    {
+        return await _permissionReadRepository.GetByIdAsync(id);
+    }
+
+    public async Task UpdatePermissionAsync(Permission permission)
+    {
+        _permissionWriteRepository.Update(permission);
+        await _unitOfWork.CompleteAsync();
+    }
+
+    public async Task DeletePermissionAsync(Guid id)
+    {
+        var permission = await _permissionReadRepository.GetByIdAsync(id);
+        if (permission != null)
+        {
+            _permissionWriteRepository.Remove(permission);
+            await _unitOfWork.CompleteAsync();
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\ApplicationServices\RoleApplicationService.cs
+
+using Domain.Entities;
+using Domain.ValueObjects;
+using Microsoft.EntityFrameworkCore;
+using SharedDomain;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using UnitOfWork;
+using UnitOfWork.Repositories;
+
+namespace Application.ApplicationServices
+{
+    public class RoleApplicationService
+    {
+        private readonly IUnitOfWork _unitOfWork;
+        private readonly RoleBasedAccessControl _roleBasedAcessControl;
+
+        public RoleApplicationService(IUnitOfWork unitOfWork, RoleBasedAccessControl roleBasedAcessControl)
+        {
+            _unitOfWork = unitOfWork;
+            _roleBasedAcessControl = roleBasedAcessControl;
+
+        }
+
+        private IReadRepository<Role> _roleReadRepository => _unitOfWork.GetReadRepository<Role>();
+        private IWriteRepository<Role> _roleWriteRepository => _unitOfWork.GetWriteRepository<Role>();
+        private IReadRepository<Permission> _permissionReadRepository => _unitOfWork.GetReadRepository<Permission>();
+        private IWriteRepository<Permission> _permissionWriteRepository => _unitOfWork.GetWriteRepository<Permission>();
+
+        public async Task<PagedResult<Role>> GetRolesPaginatedAsync(int pageNumber, int pageSize)
+        {
+            var skip = (pageNumber - 1) * pageSize;
+            var totalCount = await _roleReadRepository.AsQueryable().CountAsync();
+            var roles = await _roleReadRepository.AsQueryable()
+                .Include(r => r.Localizations)
+                .OrderBy(r => r.NormalizedName)
+                .Skip(skip)
+                .Take(pageSize)
+                .ToListAsync();
+
+            return new PagedResult<Role>(roles, totalCount, pageNumber, pageSize);
+        }
+        public async Task<Role> GetRoleByIdAsync(Guid id)
+        {
+            return await _roleReadRepository.GetByIdAsync(id);
+        }
+        public async Task CreateRole(string tenantId, string roleName, int userType, bool isSystem, List<Permission> permissions, List<RoleLocalization> localizations, TenantRole userRole)
+        {
+            if (!_roleBasedAcessControl.HasPermission(userRole, "ManageRoles"))
+            {
+                throw new UnauthorizedAccessException("You do not have permission to create roles.");
+            }
+
+            var requestedPermissions = permissions.Select(p => p.Name).ToList();
+            if (!_roleBasedAcessControl.CanCreateRole(userRole, requestedPermissions))
+            {
+                throw new UnauthorizedAccessException("You cannot create a role with permissions you do not have.");
+            }
+
+            var role = new Role(roleName, userType, isSystem);
+
+            foreach (var localization in localizations)
+            {
+                role.AddLocalization(localization);
+            }
+
+            foreach (var perm in permissions)
+            {
+                var permission = await GetOrCreatePermissionAsync(perm.Name, userType.ToString());
+                var rolePermission = new RolePermission(role.Id, permission.Id);
+                role.RolePermissions.Add(rolePermission);
+            }
+
+            await _roleWriteRepository.AddAsync(role);
+            await _unitOfWork.CompleteAsync();
+        }
+
+        public async Task CreateAdminRole()
+        {
+            // Create the admin role
+            var adminRole = new Role("Admin", (int)UserType.Admin, isSystem: true);
+
+            // Define the permissions required for the admin role
+            var permissionNames = new List<string>
+    {
+        "ManageTenants",
+        "ManageUsers",
+        "ManageRoles",
+        "ManagePermissions"
+    };
+
+            // Ensure each permission exists in the database
+            foreach (var permissionName in permissionNames)
+            {
+                var permission = await _permissionReadRepository.AsQueryable()
+                    .FirstOrDefaultAsync(p => p.Name == permissionName);
+
+                if (permission == null)
+                {
+                    // If the permission doesn't exist, create it
+                    permission = new Permission(permissionName, "Admin");
+                    await _permissionWriteRepository.AddAsync(permission);
+                    await _unitOfWork.CompleteAsync();
+                }
+
+                // Create the RolePermission linking the role and permission
+                var rolePermission = new RolePermission(adminRole.Id, permission.Id);
+                adminRole.RolePermissions.Add(rolePermission);
+            }
+
+            // Add the admin role to the database
+            await _roleWriteRepository.AddAsync(adminRole);
+            await _unitOfWork.CompleteAsync();
+        }
+        private async Task<Permission> GetOrCreatePermissionAsync(string permissionName, string userType)
+        {
+            var existingPermission = await _permissionReadRepository.AsQueryable()
+                .FirstOrDefaultAsync(p => p.Name == permissionName);
+
+            if (existingPermission != null)
+            {
+                return existingPermission;
+            }
+
+            var newPermission = new Permission(permissionName, userType);
+            await _permissionWriteRepository.AddAsync(newPermission);
+            await _unitOfWork.CompleteAsync();
+            return newPermission;
+        }
+
+        public async Task UpdateRolePermissions(Guid roleId, List<RolePermission> permissions)
+        {
+            var role = await _roleReadRepository.GetByIdAsync(roleId);
+            if (role == null)
+            {
+                throw new Exception("Role not found.");
+            }
+
+            foreach (var permission in permissions)
+            {
+                role.AddRolePermission(permission);
+            }
+
+            _roleWriteRepository.Update(role);
+            await _unitOfWork.CompleteAsync();
+        }
+
+        public async Task UpdateRoleLocalizations(Guid roleId, List<RoleLocalization> rolesLocalization)
+        {
+            var role = await _roleReadRepository.GetByIdAsync(roleId);
+            if (role == null)
+            {
+                throw new Exception("Role not found.");
+            }
+
+            foreach (var roleLocalization in rolesLocalization)
+            {
+                role.AddLocalization(roleLocalization);
+            }
+
+            _roleWriteRepository.Update(role);
+            await _unitOfWork.CompleteAsync();
+        }
+
+        public async Task DeleteRole(Guid roleId)
+        {
+            var role = await _roleReadRepository.GetByIdAsync(roleId);
+            if (role != null)
+            {
+                _roleWriteRepository.Remove(role);
+                await _unitOfWork.CompleteAsync();
+            }
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\ApplicationServices\TenantApplicationService.cs
+
+using Application.DTOs;
+using Domain.Entities;
+using Microsoft.EntityFrameworkCore;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using UnitOfWork;
+using UnitOfWork.Repositories;
+
+namespace Application.ApplicationServices
+{
+    public class TenantApplicationService
+    {
+        private readonly IUnitOfWork _unitOfWork;
+
+        public TenantApplicationService(IUnitOfWork unitOfWork)
+        {
+            _unitOfWork = unitOfWork;
+        }
+
+        private IReadRepository<Tenant> _tenantReadRepository => _unitOfWork.GetReadRepository<Tenant>();
+        private IWriteRepository<Tenant> _tenantWriteRepository => _unitOfWork.GetWriteRepository<Tenant>();
+
+        public async Task<PagedResult<Tenant>> GetTenantsPaginatedAsync(int pageNumber, int pageSize)
+        {
+            var skip = (pageNumber - 1) * pageSize;
+            var totalCount = await _tenantReadRepository.AsQueryable().CountAsync();
+            var tenants = await _tenantReadRepository.AsQueryable()
+                .OrderBy(t => t.Name)
+                .Skip(skip)
+                .Take(pageSize)
+                .ToListAsync();
+
+            return new PagedResult<Tenant>(tenants, totalCount, pageNumber, pageSize);
+        }
+
+        public async Task CreateTenant(CreateTenantRequest request)
+        {
+            var tenant = new Tenant(request.Name);
+            await _tenantWriteRepository.AddAsync(tenant);
+            await _unitOfWork.CompleteAsync();
+        }
+
+        public async Task UpdateTenant(UpdateTenantRequest request)
+        {
+            var tenant = await _tenantReadRepository.GetByIdAsync(request.TenantId);
+            if (tenant == null)
+            {
+                throw new Exception("Tenant not found.");
+            }
+
+            tenant.UpdateName(request.Name);
+            _tenantWriteRepository.Update(tenant);
+            await _unitOfWork.CompleteAsync();
+        }
+
+        public async Task DeleteTenant(DeleteTenantRequest request)
+        {
+            var tenant = await _tenantReadRepository.GetByIdAsync(request.TenantId);
+            if (tenant != null)
+            {
+                _tenantWriteRepository.Remove(tenant);
+                await _unitOfWork.CompleteAsync();
+            }
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\ApplicationServices\UserFactory.cs
+
+using Domain.Entities;
+using Domain.ValueObjects;
+using SharedDomain.Common;
+using System;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace Application.ApplicationServices
+{
+    public static class UserFactory
+    {
+        public static User CreateUser(string identifier, string password= "defaultPassword")
+        {
+            byte[] passwordHash, passwordSalt;
+            CreatePasswordHash(password, out passwordHash, out passwordSalt);
+
+            if (InputValidator.IsEmail(identifier))
+            {
+                return new User(identifier, new Email(identifier), passwordHash, passwordSalt);
+            }
+            else if (InputValidator.IsPhoneNumber(identifier))
+            {
+                return new User(identifier, new PhoneNumber(identifier), passwordHash, passwordSalt);
+            }
+            else
+            {
+                throw new ArgumentException("Invalid identifier. Please provide a valid email or phone number.");
+            }
+        }
+
+        private static void CreatePasswordHash(string password, out byte[] passwordHash, out byte[] passwordSalt)
+        {
+            using (var hmac = new HMACSHA512())
+            {
+                passwordSalt = hmac.Key;
+                passwordHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(password));
+            }
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\ApplicationServices\UserProfileApplicationService.cs
+
+using Application.DTOs;
+using Domain.Entities;
+using Domain.ValueObjects;
+using SharedDomain.Common;
+using System;
+using System.Threading.Tasks;
+using UnitOfWork;
+using UnitOfWork.Repositories;
+
+namespace Application.ApplicationServices
+{
+    public class UserProfileApplicationService
+    {
+        private readonly IUnitOfWork _unitOfWork;
+
+        public UserProfileApplicationService(IUnitOfWork unitOfWork)
+        {
+            _unitOfWork = unitOfWork;
+        }
+
+        private IReadRepository<User> _userReadRepository => _unitOfWork.GetReadRepository<User>();
+        private IWriteRepository<User> _userWriteRepository => _unitOfWork.GetWriteRepository<User>();
+
+        public async Task UpdateUserProfile(Guid userId, string newEmail, string newUsername)
+        {
+            var user = await _userReadRepository.GetByIdAsync(userId);
+            if (user == null)
+            {
+                throw new Exception("User not found.");
+            }
+
+            user.UpdateEmail(newEmail);
+            user.UpdateUsername(newUsername);
+            _userWriteRepository.Update(user);
+            await _unitOfWork.CompleteAsync();
+        }
+
+        public async Task UpdatePassword(Guid userId, string newPassword)
+        {
+            var user = await _userReadRepository.GetByIdAsync(userId);
+            if (user == null)
+            {
+                throw new Exception("User not found.");
+            }
+
+            byte[] passwordHash, passwordSalt;
+            User.CreatePasswordHash(newPassword, out passwordHash, out passwordSalt);
+            user.UpdatePassword(passwordHash, passwordSalt);
+            _userWriteRepository.Update(user);
+            await _unitOfWork.CompleteAsync();
+        }
+
+        public async Task EnableMultiFactorAuthentication(Guid userId, string secretKey)
+        {
+            var user = await _userReadRepository.GetByIdAsync(userId);
+            if (user == null)
+            {
+                throw new Exception("User not found.");
+            }
+
+            user.EnableMultiFactorAuthentication(secretKey);
+            _userWriteRepository.Update(user);
+            await _unitOfWork.CompleteAsync();
+        }
+
+        public async Task DisableMultiFactorAuthentication(Guid userId)
+        {
+            var user = await _userReadRepository.GetByIdAsync(userId);
+            if (user == null)
+            {
+                throw new Exception("User not found.");
+            }
+
+            user.DisableMultiFactorAuthentication();
+            _userWriteRepository.Update(user);
+            await _unitOfWork.CompleteAsync();
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\AddUserToTenantRequest.cs
+
+using Domain.ValueObjects;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class AddUserToTenantRequest
+    {
+        public Guid UserId { get; set; }
+        public Guid TenantId { get; set; }
+        public TenantRole Role { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\CreatePermissionRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class CreatePermissionRequest
+{
+        public string Name { get; set; }
+        public string UserType { get; set; }
+}
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\CreateRoleRequest.cs
+
+using Domain.Entities;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class CreateRoleRequest
+    {
+        public string TenantId { get; set; }
+        public string RoleName { get; set; }
+        public int UserType { get; set; }
+        public bool isSystem { get; set; }
+        public List<Permission> Permissions { get; set; }
+        public List<RoleLocalization> localizations { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\CreateTenantRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class CreateTenantRequest
+    {
+        public string Name { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\DeleteRoleRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class DeleteRoleRequest
+    {
+        public Guid RoleId { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\DeleteTenantRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class DeleteTenantRequest
+    {
+        public Guid TenantId { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\DisableMfaRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class DisableMultiFactorAuthenticationRequest
+    {
+        public Guid UserId { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\EnableMfaRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class EnableMultiFactorAuthenticationRequest
+    {
+        public Guid UserId { get; set; }
+        public string SecretKey { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\ForgotPasswordRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class ForgotPasswordRequest
+    {
+        public string Identifier { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\GenerateOtpRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class GenerateOtpRequest
+    {
+        public string UserName { get; set; } 
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\LoginDTO.cs
+
+using SharedDomain;
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class LoginDTO
+    {
+        [Required]
+        public string Username { get; set; }  
+
+        [Required]
+        public string Password { get; set; }  
+
+        [Required]
+        public string DeviceToken { get; set; }
+
+        public string DeviceId { get; set; }  
+
+        [Required]
+        public UserType UserType { get; set; }
+
+        [Required]
+        public string ClientId { get; set; }
+
+        [Required]
+        public string ClientSecret { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\LoginResponseDTO.cs
+
+using ProtoBuf;
+using SharedDomain;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    [ProtoContract]
+    public class LoginResponseDTO
+    {
+        [ProtoMember(1)]
+        public string AccessToken { get; set; }
+
+        [ProtoMember(2)]
+        public string RefreshToken { get; set; }
+
+        [ProtoMember(3)]
+        public DateTime? TokenExpiration { get; set; }
+
+        [ProtoMember(4)]
+        public DateTime? RefreshTokenExpiration { get; set; }
+
+        [ProtoMember(5)]
+        public string Name { get; set; }
+
+        [ProtoMember(6)]
+        public string UserName { get; set; }
+
+        [ProtoMember(7)]
+        public string CompanyName { get; set; }
+
+        [ProtoMember(8)]
+        public string CompanyUniqueName { get; set; }
+
+        [ProtoMember(9)]
+        public string Image { get; set; }
+
+        [ProtoMember(10)]
+        public IEnumerable<string> Roles { get; set; }
+
+        [ProtoMember(11)]
+        public UserType UserType { get; set; }
+
+        [ProtoMember(12)]
+        public int UserBusinessType { get; set; }
+
+        [ProtoMember(13)]
+        public string UserID { get; set; }
+
+        [ProtoMember(14)]
+        public bool IsEmailVerify { get; set; }
+
+        [ProtoMember(15)]
+        public bool IsUserProfileCompleted { get; set; }
+
+        [ProtoMember(16)]
+        public bool IsCompanyProfileCompleted { get; set; }
+
+        [ProtoMember(17)]
+        public bool? IsCompanyApproved { get; set; }
+
+        [ProtoMember(18)]
+        public Guid? TenantId { get; set; }
+
+        [ProtoMember(19)]
+        public string CountryCode { get; set; }
+
+        [ProtoMember(20)]
+        public string PhoneNumber { get; set; }
+
+        [ProtoMember(21)]
+        public bool IsTravelShopOwner { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\LogoutDTO.cs
+
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class LogoutDTO
+    {
+        [Required]
+        public string DeviceToken { get; set; }
+
+        [Required]
+        public string DeviceID { get; set; } 
+
+        [Required]
+        public string ClientId { get; set; } 
+
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\RefreshTokenDTO.cs
+
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class RefreshTokenDTO
+    {
+        [Required]
+        public string Token { get; set; }  
+
+        [Required]
+        public string RefreshToken { get; set; }  
+
+        [Required]
+        public string ClientId { get; set; } 
+
+        [Required]
+        public string ClientSecret { get; set; } 
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\RegisterRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class RegisterRequest
+    {
+        public string UserName { get; set; } 
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\RegisterUserRequest.cs
+
+using Domain.ValueObjects;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class RegisterUserRequest
+    {
+        public string Username { get; set; }
+        public string Email {  get; set; }
+        public List<Guid> TenantIds {  get; set; }
+        public TenantRole Role { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\RemoveUserFromTenantRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class RemoveUserFromTenantRequest
+    {
+        public Guid UserId { get; set; }
+        public Guid TenantId { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\ResetPasswordRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class ResetPasswordRequest
+    {
+        public string Identifier { get; set; }
+        public string NewPassword { get; set; }
+        public string VerificationCode { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\RevokeTokenRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class RevokeTokenRequest
+    {
+        public string Token { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\SecurityEventRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class SecurityEventRequest
+    {
+        public string EventType { get; set; }
+        public string Details { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\UpdatePasswordRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class UpdatePasswordRequest
+    {
+        public Guid UserId { get; set; }
+        public string NewPassword { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\UpdatePermissionRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class UpdatePermissionRequest
+{
+        public string Name { get; set; }
+        public string UserType { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\UpdateRolePermissionsRequest.cs
+
+using Domain.Entities;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class UpdateRolePermissionsRequest
+    {
+        public Guid RoleId { get; set; }
+        public List<RolePermission> Permissions { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\UpdateTenantRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class UpdateTenantRequest
+    {
+        public Guid TenantId { get; set; }
+        public string Name { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\UpdateUserProfileRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class UpdateUserProfileRequest
+    {
+        public Guid UserId { get; set; }
+        public string NewEmail { get; set; }
+        public string NewUsername { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\VerifyMfaRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class VerifyMfaRequest
+    {
+        public string Username { get; set; }
+        public string MfaCode { get; set; }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\DTOs\VerifyOtpRequest.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Application.DTOs
+{
+    public class VerifyOtpRequest
+    {
+        public string Username { get; set; } 
+        public string Otp { get; set; }     
+        public string DeviceToken { get; set; }
+        public string DeviceId { get; set; }
+        public string ClientId { get; set; }
+        public string ClientSecret { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\ApplicationLayer\Security\RoleBasedAccessControl.cs
+
+using Domain.ValueObjects;
+
+public class RoleBasedAccessControl
+{
+    private readonly Dictionary<TenantRole, List<string>> _rolePermissions;
+
+    public RoleBasedAccessControl()
+    {
+        _rolePermissions = new Dictionary<TenantRole, List<string>>
+        {
+            { TenantRole.SuperAdmin, new List<string> { "ManageTenants", "ManageUsers", "ViewReports", "ManageRoles", "ManagePermissions" } },
+            { TenantRole.TenantAdmin, new List<string> { "ManageUsers", "AssignRoles", "ManageRoles" } },
+            { TenantRole.User, new List<string> { "ViewContent" } },
+            { TenantRole.Admin, new List<string> { "ManageTenants", "ManageUsers", "ManageRoles", "ManagePermissions" } }
+        };
+    }
+
+    public bool HasPermission(TenantRole role, string permission)
+    {
+        if (_rolePermissions.TryGetValue(role, out var permissions))
+        {
+            return permissions.Contains(permission);
+        }
+        return false;
+    }
+
+    public bool CanCreateRole(TenantRole userRole, List<string> requestedPermissions)
+    {
+        
+        var userPermissions = _rolePermissions[userRole];
+        return requestedPermissions.All(p => userPermissions.Contains(p));
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Aggregates\TenantAggregate.cs
+
+using Domain.Entities;
+using Domain.ValueObjects;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.Aggregates
+{
+    public class TenantAggregate
+    {
+        public Tenant Tenant {  get; private set; }
+        public List<User> Users { get; private set; }
+
+        public TenantAggregate(Tenant tenant) 
+        {
+            Tenant = tenant;
+            Users = new List<User>();
+        }
+
+        public void AddUser(User user, TenantRole role)
+        {
+           Tenant.AddUser(user, role);
+            if (!Users.Contains(user))
+            {
+                Users.Add(user);
+            }
+        }
+        public void RemoveUser(User user) { 
+            Tenant.UserTenants.RemoveAll(ut => ut.User.Id == user.Id);
+            Users.Remove(user);
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Aggregates\UserAggregate.cs
+
+using Domain.Entities;
+using Domain.ValueObjects;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.Aggregates
+{
+    public class UserAggregate
+    {
+        public User User { get; private set; }
+        public List<UserTenant> UserTenants => User.UserTenants;
+
+        public UserAggregate(User user)
+        {
+            User = user;
+        }
+
+        public void UpdateEmail(string newEmail)
+        {
+        }
+
+        public void UpdateUsername(string newUsername)
+        {
+        }
+
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\DomainEvents\TenantCreatedEvent.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.DomainEvents
+{
+    public class TenantCreatedEvent
+    {
+        public Guid TenantId { get; private set;}
+        public string TenantName {  get; private set;}
+
+        public TenantCreatedEvent(Guid tenantId, string tenantName)
+        {
+            TenantId=tenantId;
+            TenantName=tenantName;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\DomainEvents\UserRegisteredEvent .cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.DomainEvents
+{
+    public class UserRegisteredEvent 
+    {
+        public Guid UserId { get; private set; }
+        public string UserName { get; private set; }
+        public string Email { get; private set; }
+
+        public UserRegisteredEvent(Guid userId, string username, string email)
+        {
+            UserId = userId;
+            UserName = username;
+            Email = email;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\Permission.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using SharedDomain.Common;
+
+namespace Domain.Entities
+{
+    public class Permission : BaseEntity
+    {
+        public string Name { get; set; }
+        public string UserType { get; set; }
+        public ICollection<PermissionLocalization> Localizations { get; private set; }
+        public List<RolePermission> RolePermissions { get; private set; }
+
+        public Permission(string name, string userType)
+        {
+            Name = name;
+            UserType = userType;
+        }
+
+        public void AddLocalization(PermissionLocalization localization)
+        {
+            Localizations.Add(localization);
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\PermissionLocalization.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using SharedDomain.Common;
+
+
+namespace Domain.Entities
+{
+    public class PermissionLocalization : BaseEntity
+    {
+        public Guid PermissionId { get; private set; }
+        public int LanguageId { get; private set; }
+        public string Name { get; private set; }
+
+        public Permission Permission { get; private set; }
+
+        public PermissionLocalization(Guid permissionId, int languageId, string name)
+        {
+            PermissionId = permissionId;
+            LanguageId = languageId;
+            Name = name;
+        }
+    }
+
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\RefreshToken.cs
+
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.Entities
+{
+    public class RefreshToken : BaseEntity
+    {
+        public string Token { get; private set; }
+        public DateTime Expires { get; private set; }
+        public Guid UserId { get; private set; }
+        public bool IsExpired => DateTime.UtcNow >= Expires;
+        public bool IsRevoked { get; private set; } = false;
+
+        public bool IsActive => !IsExpired && !IsRevoked;
+        public User User { get; private set; }
+
+        public RefreshToken(string token, DateTime expires, Guid userId)
+        {
+            Token = token;
+            Expires = expires;
+            UserId = userId;
+        }
+        public void Revoke()
+        {
+            IsRevoked = true;
+            SetUpdateProperties(UserId.ToString()); 
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\Role.cs
+
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.Entities
+{
+    public class Role : BaseEntity
+    {
+        public string ConcurrencyStamp { get; private set; }
+        public string NormalizedName { get; private set; }
+        public DateTime CreateDate { get; private set; }
+        public bool IsActive { get; private set; }
+        public int UserType { get; private set; }
+        public bool IsSystem { get; private set; }
+        public int RoleTypeID { get; private set; }
+        public List<RoleLocalization> Localizations { get; private set; } = new();
+        public List<RolePermission> RolePermissions { get; private set; } = new();
+
+        public List<UserRole> UserRoles { get; private set; } = new();
+
+        public Role(string normalizedName, int userType, bool isSystem=false)
+        {
+            NormalizedName = normalizedName;
+            UserType = userType;
+            IsSystem = isSystem;
+            ConcurrencyStamp = Guid.NewGuid().ToString();
+            CreateDate = DateTime.UtcNow;
+            IsActive = true;
+        }
+
+        public void AddLocalization(RoleLocalization localization)
+        {
+            Localizations.Add(localization);
+        }
+        public void AddRolePermission(RolePermission localization)
+        {
+            RolePermissions.Add(localization);
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\RoleLocalization.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using SharedDomain.Common;
+
+namespace Domain.Entities
+{
+    public class RoleLocalization : BaseEntity
+    {
+        public Guid RoleId { get; private set; }
+        public int LanguageId { get; private set; }
+        public string Name { get; private set; }
+
+        public Role Role { get; private set; }
+
+        public RoleLocalization(Guid roleId, int languageId, string name)
+        {
+            RoleId = roleId;
+            LanguageId = languageId;
+            Name = name;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\RolePermission .cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using SharedDomain.Common;
+
+namespace Domain.Entities
+{
+    public class RolePermission : BaseEntity
+    {
+        public Guid RoleId { get; private set; }
+        public Guid PermissionId { get; private set; }
+
+        public Role Role { get; private set; }
+        public Permission Permission { get; private set; }
+
+        public RolePermission(Guid roleId, Guid permissionId)
+        {
+            RoleId = roleId;
+            PermissionId = permissionId;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\Tenant.cs
+
+using Domain.ValueObjects;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.Entities
+{
+    public class Tenant : BaseEntity
+    {
+        public string Name { get; private set; }
+
+        public List<UserTenant> UserTenants { get; private set; } = new List<UserTenant>();
+
+
+        public Tenant(string name)
+        {
+            Name = name;
+        }
+
+        public void AddUser(User user, TenantRole role)
+        {
+            var userTenant = new UserTenant(user, this, role);
+            UserTenants.Add(userTenant);
+        }
+
+        public void UpdateName(string name)
+        {
+            Name = name;
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\User.cs
+
+using Domain.DomainEvents;
+using Domain.ValueObjects;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Collections.ObjectModel;
+using SharedDomain.Common;
+using System.Runtime.Serialization;
+using Microsoft.AspNetCore.Http.HttpResults;
+using SharedDomain;
+namespace Domain.Entities
+{
+    public class User : BaseEntity
+    {
+        public string Username { get; private set; }
+        public byte[] PasswordHash { get; private set; }
+        public byte[] PasswordSalt { get; private set; }
+
+        public Email? Email { get; private set; }
+        public PhoneNumber? PhoneNumber { get; private set; }
+        public bool IsMfaEnabled { get; private set; } = false;
+        public string MfaSecretKey { get; private set; } = string.Empty;
+
+        public bool IsPhoneVerified { get; private set; } = false;
+        public bool IsEmailVerified { get; private set; } = false;
+
+        public string? VerificationCode { get; private set; } = null;
+        public DateTime? VerificationCodeExpiry { get; private set; } = null;
+
+        public List<UserTenant> UserTenants { get; private set; } = new List<UserTenant>();
+        public List<UserRole> UserRoles { get; private set; } = new List<UserRole>();
+        public List<RefreshToken> RefreshTokens { get; private set; } = new List<RefreshToken>();
+
+        public string Name { get; private set; } = string.Empty;
+        public string CompanyName { get; private set; } = string.Empty;
+        public string CompanyUniqueName { get; private set; } = string.Empty;
+        public string Image { get; private set; } = string.Empty;
+        public UserType UserType { get; private set; } = UserType.Customer;
+        public int UserBusinessType { get; private set; } = 0;
+        public Guid? TenantId { get; private set; }
+        public string CountryCode { get; private set; } = string.Empty;
+        public bool IsTravelShopOwner { get; private set; } = false;
+
+        public bool IsUserProfileCompleted { get; private set; } = false;
+        public bool IsCompanyProfileCompleted { get; private set; } = false;
+        public bool? IsCompanyApproved { get; private set; } = false;
+
+        public virtual ICollection<UserDevice> UserDevices { get; private set; } = new List<UserDevice>();
+        public virtual ICollection<UserClient> UserClients { get; private set; } = new List<UserClient>();
+
+        public User() { }
+
+        public User(string username, Email email, byte[] passwordHash, byte[] passwordSalt)
+        {
+            Username = username;
+            Email = email;
+            PhoneNumber = null;
+            PasswordHash = passwordHash;
+            PasswordSalt = passwordSalt;
+            SetCreationProperties(username);
+        }
+
+        public User(string username, PhoneNumber phoneNumber, byte[] passwordHash, byte[] passwordSalt)
+        {
+            Username = username;
+            PhoneNumber = phoneNumber;
+            Email = null;
+            PasswordHash = passwordHash;
+            PasswordSalt = passwordSalt;
+            SetCreationProperties(username);
+        }
+
+        public void EnableMultiFactorAuthentication(string secretKey)
+        {
+            IsMfaEnabled = true;
+            MfaSecretKey = secretKey;
+        }
+
+        public void DisableMultiFactorAuthentication()
+        {
+            IsMfaEnabled = false;
+            MfaSecretKey = string.Empty;
+        }
+
+
+        public void SetVerificationCode(string code, DateTime expiry)
+        {
+            VerificationCode = code;
+            VerificationCodeExpiry = expiry;
+            SetUpdateProperties(Username);
+        }
+
+        public void MarkPhoneAsVerified()
+        {
+            IsPhoneVerified = true;
+            SetUpdateProperties(Username);
+        }
+
+        public void MarkEmailAsVerified()
+        {
+            IsEmailVerified = true;
+            SetUpdateProperties(Username);
+        }
+
+        public void UpdatePassword(byte[] passwordHash, byte[] passwordSalt)
+        {
+            PasswordHash = passwordHash;
+            PasswordSalt = passwordSalt;
+            SetUpdateProperties(Username);
+        }
+
+        public void UpdateEmail(string newEmail)
+        {
+            Email = new Email(newEmail);
+            SetUpdateProperties(Username);
+        }
+
+        public void UpdateUsername(string newUsername)
+        {
+            Username = newUsername;
+            SetUpdateProperties(Username);
+        }
+
+        public static void CreatePasswordHash(string password, out byte[] passwordHash, out byte[] passwordSalt)
+        {
+            using (var hmac = new System.Security.Cryptography.HMACSHA512())
+            {
+                passwordSalt = hmac.Key;
+                passwordHash = hmac.ComputeHash(System.Text.Encoding.UTF8.GetBytes(password));
+            }
+        }
+
+        public void AddTenant(Tenant tenant, TenantRole role)
+        {
+            var userTenant = new UserTenant(this, tenant, role);
+            UserTenants.Add(userTenant);
+        }
+
+        public void RemoveTenant(Tenant tenant)
+        {
+            UserTenants.RemoveAll(ut => ut.TenantId == tenant.Id);
+        }
+
+        public void AddRefreshToken(RefreshToken refreshToken)
+        {
+            RefreshTokens.Add(refreshToken);
+        }
+
+        public void RemoveRefreshToken(string token)
+        {
+            RefreshTokens.RemoveAll(rt => rt.Token == token);
+        }
+
+        public void SetName(string name)
+        {
+            Name = name;
+            SetUpdateProperties(Username);
+        }
+
+        public void SetCompanyDetails(string companyName, string companyUniqueName)
+        {
+            CompanyName = companyName;
+            CompanyUniqueName = companyUniqueName;
+            SetUpdateProperties(Username);
+        }
+
+        public void SetImage(string imageUrl)
+        {
+            Image = imageUrl;
+            SetUpdateProperties(Username);
+        }
+
+        public void SetUserType(UserType userType)
+        {
+            UserType = userType;
+            SetUpdateProperties(Username);
+        }
+
+        public void SetUserBusinessType(int userBusinessType)
+        {
+            UserBusinessType = userBusinessType;
+            SetUpdateProperties(Username);
+        }
+
+        public void SetTenantId(Guid? tenantId)
+        {
+            TenantId = tenantId;
+            SetUpdateProperties(Username);
+        }
+
+        public void SetCountryCode(string countryCode)
+        {
+            CountryCode = countryCode;
+            SetUpdateProperties(Username);
+        }
+
+        public void SetTravelShopOwner(bool isTravelShopOwner)
+        {
+            IsTravelShopOwner = isTravelShopOwner;
+            SetUpdateProperties(Username);
+        }
+
+        public void MarkUserProfileAsCompleted()
+        {
+            IsUserProfileCompleted = true;
+            SetUpdateProperties(Username);
+        }
+
+        public void MarkCompanyProfileAsCompleted()
+        {
+            IsCompanyProfileCompleted = true;
+            SetUpdateProperties(Username);
+        }
+
+        public void ApproveCompany()
+        {
+            IsCompanyApproved = true;
+            SetUpdateProperties(Username);
+        }
+
+        public void RejectCompany()
+        {
+            IsCompanyApproved = false;
+            SetUpdateProperties(Username);
+        }
+
+        public void AddDevice(string deviceToken, string deviceId)
+        {
+            var device = new UserDevice(Id, deviceToken, deviceId);
+            UserDevices.Add(device);
+            SetUpdateProperties(Username);
+        }
+        public void RemoveDevice(string deviceId)
+        {
+            var device = UserDevices.FirstOrDefault(d => d.DeviceId == deviceId);
+            if (device != null)
+            {
+                UserDevices.Remove(device);
+                SetUpdateProperties(Username);
+            }
+        }
+        public void AddClient(string clientId, string clientSecret)
+        {
+            var client = new UserClient(Id, clientId, clientSecret);
+            UserClients.Add(client);
+            SetUpdateProperties(Username);
+        }
+        public void RemoveClient(string clientId)
+        {
+            var client = UserClients.FirstOrDefault(c => c.ClientId == clientId);
+            if (client != null)
+            {
+                UserClients.Remove(client);
+                SetUpdateProperties(Username);
+            }
+        }
+
+
+
+    }
+
+
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\UserClient.cs
+
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations.Schema;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using SharedDomain.Common;
+
+namespace Domain.Entities
+{
+    public class UserClient : BaseEntity
+    {
+        public Guid UserId { get; private set; }
+        public string ClientId { get; private set; }
+        public string ClientSecret { get; private set; }
+
+        public User User { get; private set; }
+
+        public UserClient(Guid userId, string clientId, string clientSecret)
+        {
+            UserId = userId;
+            ClientId = clientId;
+            ClientSecret = clientSecret;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\UserDevice.cs
+
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations.Schema;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using SharedDomain.Common;
+
+namespace Domain.Entities
+{
+    public class UserDevice : BaseEntity
+    {
+        public Guid UserId { get; private set; }
+        public string DeviceToken { get; private set; }
+        public string DeviceId { get; private set; }
+
+        public User User { get; private set; }
+
+        public UserDevice(Guid userId, string deviceToken, string deviceId)
+        {
+            UserId = userId;
+            DeviceToken = deviceToken;
+            DeviceId = deviceId;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\UserRole.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using SharedDomain.Common;
+
+namespace Domain.Entities
+{
+    public class UserRole : BaseEntity
+    {
+        public Guid UserId { get; private set; }
+        public Guid RoleId { get; private set; }
+        public Guid TenantId { get; private set; }
+
+        public User User { get; private set; }
+        public Role Role { get; private set; }
+        public Tenant Tenant { get; private set; }
+
+
+        public UserRole(Guid userId, Guid roleId, Guid tenantId)
+        {
+            UserId = userId;
+            RoleId = roleId;
+            TenantId = tenantId;
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\Entities\UserTenant.cs
+
+using Domain.ValueObjects;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using SharedDomain.Common;
+
+namespace Domain.Entities
+{
+    public class UserTenant : BaseEntity
+    {
+
+
+        public Guid UserId { get; private set; }
+        public User User { get; private set; }
+        public Guid TenantId { get; private set; }
+        public Tenant Tenant { get; private set; }
+        public TenantRole Role { get; private set; }
+
+        public UserTenant() { }
+        public UserTenant(User user, Tenant tenant, TenantRole role)
+        {
+            User = user;
+            Tenant = tenant;
+            Role = role;
+            UserId = user.Id;
+            TenantId = tenant.Id;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\ValueObjects\Email.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+
+namespace Domain.ValueObjects
+{
+    public class Email
+    {
+        public string Value { get; private init; }
+
+        public Email(string value)
+        {
+            Value = value;
+        }
+
+        public override string ToString()
+        {
+            return Value;
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\ValueObjects\PhoneNumber.cs
+
+using System;
+
+namespace Domain.ValueObjects
+{
+    public class PhoneNumber
+    {
+        public string Value { get; private set; }
+
+        private PhoneNumber() { }
+
+        public PhoneNumber(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+                throw new ArgumentException("Phone number cannot be empty", nameof(value));
+
+            Value = value;
+        }
+
+        public override string ToString()
+        {
+            return Value;
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\DomainLayer\ValueObjects\TenantRole.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Domain.ValueObjects
+{
+    public enum TenantRole
+    {
+        SuperAdmin,
+        TenantAdmin,
+        User,
+        Admin
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Persistence\AppDbContext.cs
+
+using Domain.Entities;
+using Microsoft.EntityFrameworkCore;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection.Emit;
+using System.Text;
+using System.Threading.Tasks;
+using UnitOfWork.Context;
+
+namespace Infrastructure.Persistence
+{
+    public class AppDbContext : ContextBase
+    {
+        public DbSet<User> Users { get; set; }
+        public DbSet<Tenant> Tenants { get; set; }
+        public DbSet<UserTenant> UserTenants { get; set; }
+        public DbSet<Role> Roles { get; set; }
+        public DbSet<UserRole> UserRoles { get; set; }
+
+        public DbSet<Permission> Permissions { get; set; }
+        public DbSet<PermissionLocalization> PermissionLocalizations { get; set; }
+        public DbSet<RefreshToken> RefreshTokens { get; set; }
+
+        public DbSet<UserDevice> UserDevices { get; set; }
+        public DbSet<UserClient> UserClients { get; set; }
+
+
+        public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            base.OnModelCreating(modelBuilder);
+
+
+          
+            modelBuilder.Entity<User>(entity =>
+            {
+                entity.OwnsOne(u => u.Email, entity =>
+                {
+                    
+                    entity.HasIndex(u => u.Value).IsUnique();
+                });
+               entity.OwnsOne(u => u.PhoneNumber);
+            });
+
+         
+            modelBuilder.Entity<UserTenant>()
+                .HasKey(ut => ut.Id); 
+
+            modelBuilder.Entity<UserTenant>()
+                .HasOne(ut => ut.User)
+                .WithMany(u => u.UserTenants)
+                .HasForeignKey(ut => ut.UserId);
+
+            modelBuilder.Entity<UserTenant>()
+                .HasOne(ut => ut.Tenant)
+                .WithMany(t => t.UserTenants)
+                .HasForeignKey(ut => ut.TenantId);
+
+            modelBuilder.Entity<UserRole>()
+                .HasKey(ur => ur.Id); 
+
+            modelBuilder.Entity<UserRole>()
+                .HasOne(ur => ur.User)
+                .WithMany(u => u.UserRoles)
+                .HasForeignKey(ur => ur.UserId);
+
+            modelBuilder.Entity<UserRole>()
+                .HasOne(ur => ur.Role)
+                .WithMany(r => r.UserRoles)
+                .HasForeignKey(ur => ur.RoleId);
+
+            modelBuilder.Entity<Permission>()
+            .HasMany(p => p.Localizations)
+            .WithOne(pl => pl.Permission)
+            .HasForeignKey(pl => pl.PermissionId);
+
+        
+
+
+            modelBuilder.Entity<Tenant>()
+                .HasIndex(t => t.Name)
+                .IsUnique();
+
+            modelBuilder.Entity<RefreshToken>()
+               .HasOne(rt => rt.User)
+               .WithMany(u => u.RefreshTokens)
+               .HasForeignKey(rt => rt.UserId);
+
+            modelBuilder.Entity<UserDevice>()
+            .HasKey(ud => ud.Id);
+
+            modelBuilder.Entity<UserDevice>()
+                .HasOne(ud => ud.User)
+                .WithMany(u => u.UserDevices)
+                .HasForeignKey(ud => ud.UserId);
+
+        
+            modelBuilder.Entity<UserClient>()
+                .HasKey(uc => uc.Id);
+
+            modelBuilder.Entity<UserClient>()
+                .HasOne(uc => uc.User)
+                .WithMany(u => u.UserClients)
+                .HasForeignKey(uc => uc.UserId);
+
+            //modelBuilder.Entity<Client>(entity =>
+            //{
+            //    entity.HasKey(c => c.Id);
+
+            //    entity.HasIndex(c => c.ClientId).IsUnique();
+
+            //    // Configure CreatedAt and UpdatedAt to be managed by the database
+            //    entity.Property(c => c.CreatedAt)
+            //          .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+            //    entity.Property(c => c.UpdatedAt)
+            //          .HasDefaultValueSql("CURRENT_TIMESTAMP")
+            //          .ValueGeneratedOnAddOrUpdate();
+            //});
+
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Persistence\Data Seeder\DataSeeder.cs
+
+using Microsoft.AspNetCore.Identity;
+using Microsoft.Extensions.DependencyInjection;
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace Infrastructure.Persistence.Repositories.Data_Seeder
+{ 
+public class DataSeeder
+{
+    public static async Task SeedAdminUser(IServiceProvider serviceProvider)
+    {
+        var userManager = serviceProvider.GetRequiredService<UserManager<IdentityUser>>();
+        var roleManager = serviceProvider.GetRequiredService<RoleManager<IdentityRole>>();
+
+        if (!await roleManager.RoleExistsAsync("Admin"))
+        {
+            await roleManager.CreateAsync(new IdentityRole("Admin"));
+        }
+
+        var adminUser = await userManager.FindByEmailAsync("admin@Estabdelha.com");
+        if (adminUser == null)
+        {
+            adminUser = new IdentityUser
+            {
+                UserName = "admin",
+                Email = "admin@Estabdelha.com",
+                EmailConfirmed = true
+            };
+            await userManager.CreateAsync(adminUser, "Test@1234");
+
+            await userManager.AddToRoleAsync(adminUser, "Admin");
+        }
+    }
+}
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Persistence\Repositories\UnitOfWork.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Microsoft.EntityFrameworkCore.Storage;
+using SharedDomain.Common;
+using UnitOfWork;
+using UnitOfWork.Repositories;
+namespace Infrastructure.Persistence.Repositories
+{
+    public class UnitOfWork : IUnitOfWork
+    {
+        private readonly AppDbContext _context;
+        private IDbContextTransaction? _currentTransaction;
+
+        public UnitOfWork(AppDbContext context)
+        {
+            _context = context;
+        }
+
+        public IReadRepository<TEntity> GetReadRepository<TEntity>() where TEntity : BaseEntity
+        {
+            return new BaseReadRepository<TEntity>(_context.Set<TEntity>());
+        }
+
+        public IWriteRepository<TEntity> GetWriteRepository<TEntity>() where TEntity : BaseEntity
+        {
+            return new BaseWriteRepository<TEntity>(_context.Set<TEntity>(), this);
+        }
+
+        public async Task<int> CompleteAsync()
+        {
+            return await _context.SaveChangesAsync();
+        }
+
+        public async Task<IDbContextTransaction> BeginTransactionAsync()
+        {
+            if (_currentTransaction is not null) return _currentTransaction;
+
+            _currentTransaction = await _context.Database.BeginTransactionAsync();
+            return _currentTransaction;
+        }
+
+        public async Task CommitTransactionAsync(IDbContextTransaction transaction)
+        {
+            if (transaction == null) throw new ArgumentNullException(nameof(transaction));
+            if (transaction != _currentTransaction) throw new InvalidOperationException($"Transaction {transaction.TransactionId} is not current");
+
+            try
+            {
+                await _context.SaveChangesAsync();
+                await transaction.CommitAsync();
+            }
+            catch
+            {
+                RollbackTransaction();
+                throw;
+            }
+            finally
+            {
+                _currentTransaction?.Dispose();
+                _currentTransaction = null;
+            }
+        }
+
+        public void RollbackTransaction()
+        {
+            try
+            {
+                _currentTransaction?.Rollback();
+            }
+            finally
+            {
+                _currentTransaction?.Dispose();
+                _currentTransaction = null;
+            }
+        }
+
+        public IDbContextTransaction? GetCurrentTransaction() => _currentTransaction;
+
+        public bool HasActiveTransaction => _currentTransaction is not null;
+
+        public void Commit() => _context.SaveChanges();
+
+        public async Task CommitAsync() => await _context.SaveChangesAsync();
+
+        public void Dispose()
+        {
+            _context.Dispose();
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Security\AuthenticationService.cs
+
+using Domain.Entities;
+using Domain.ValueObjects;
+using Microsoft.EntityFrameworkCore;
+using SharedDomain.Common;
+using System;
+using System.ComponentModel.DataAnnotations;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading.Tasks;
+using UnitOfWork;
+using UnitOfWork.Repositories;
+
+namespace Infrastructure.Security
+{
+    public class AuthenticationService
+    {
+        private readonly IUnitOfWork _unitOfWork;
+
+        public AuthenticationService(IUnitOfWork unitOfWork)
+        {
+            _unitOfWork = unitOfWork;
+        }
+
+        private IReadRepository<User> _userReadRepository => _unitOfWork.GetReadRepository<User>();
+        private IWriteRepository<User> _userWriteRepository => _unitOfWork.GetWriteRepository<User>();
+
+        public  User Authenticate(string identifier, string password)
+        {
+            var user =  _userReadRepository.AsQueryable().AsNoTracking()
+                .FirstOrDefaultAsync(u => (u.Username == identifier || u.Email.Value == identifier) && !u.IsDeleted).Result;
+            //if(user!=null  && InputValidator.IsEmail(identifier) &&
+            //    !VerifyPasswordHash(password, user.PasswordHash, user.PasswordSalt))
+            //return null;
+            if (user != null)
+            {
+                _userReadRepository.Detach(user);
+            }
+            return user;
+        }
+        public bool verifyPasswoed(User user , string password)
+        {
+            return VerifyPasswordHash(password, user.PasswordHash, user.PasswordSalt);
+        }
+        //private async Task<bool> ValidateClientAsync(string clientId, string clientSecret)
+        //{
+        //    var client = await _unitOfWork.GetReadRepository<Client>()
+        //                                  .FirstOrDefaultAsync(c => c.ClientId == clientId && c.ClientSecret == clientSecret);
+        //    return client != null;
+        //}
+        public async Task<User> Register(string identifier, string password)
+        {
+            var userExists = await _userReadRepository.AsQueryable()
+                .AnyAsync(u => (u.Username == identifier || u.Email.Value == identifier) && !u.IsDeleted);
+
+            if (userExists)
+                throw new InvalidOperationException("User already exists.");
+
+            byte[] passwordHash, passwordSalt;
+            User.CreatePasswordHash(password, out passwordHash, out passwordSalt);
+
+            var user = new User(identifier, new Email(identifier), passwordHash, passwordSalt);
+            await _userWriteRepository.AddAsync(user);
+            await _unitOfWork.CompleteAsync();
+
+            return user;
+        }
+
+        public async Task<User> GetUserByIdentifier(string identifier)
+        {
+            return await _userReadRepository.AsQueryable()
+                .FirstOrDefaultAsync(u => (u.Username == identifier || u.Email.Value == identifier) && !u.IsDeleted);
+        }
+
+        private bool VerifyPasswordHash(string password, byte[] storedHash, byte[] storedSalt)
+        {
+            using (var hmac = new HMACSHA512(storedSalt))
+            {
+                var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(password));
+                return computedHash.SequenceEqual(storedHash);
+            }
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Security\FakeEmailProvider .cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Infrastructure.Security
+{
+    public class FakeEmailProvider : IEmailProvider
+    {
+        public Task SendVerificationCodeAsync(string email, string code)
+        {
+            
+            Console.WriteLine($"Sending verification code {code} to {email}");
+            return Task.CompletedTask;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Security\FakeSmsProvider .cs
+
+using System;
+using System.Threading.Tasks;
+
+namespace Infrastructure.Security
+{
+    public class FakeSmsProvider : ISmsProvider
+    {
+        public Task SendVerificationCodeAsync(string recipient, string code)
+        {
+            
+            Console.WriteLine($"Sending verification code {code} to {recipient}");
+            return Task.CompletedTask;
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Security\ForgotPasswordService.cs
+
+using Domain.Entities;
+using Microsoft.EntityFrameworkCore;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using UnitOfWork;
+
+namespace Infrastructure.Security
+{
+    public class ForgotPasswordService : IForgotPasswordService
+    {
+        private readonly IUnitOfWork _unitOfWork;
+        private readonly ISmsProvider _smsProvider;
+        private readonly IEmailProvider _emailProvider;
+
+        public ForgotPasswordService(IUnitOfWork unitOfWork, ISmsProvider smsProvider, IEmailProvider emailProvider)
+        {
+            _unitOfWork = unitOfWork;
+            _smsProvider = smsProvider;
+            _emailProvider = emailProvider;
+        }
+
+        public async Task<string> SendPasswordResetCodeAsync(string identifier)
+        {
+            var userReadRepository = _unitOfWork.GetReadRepository<User>();
+            var user = await userReadRepository.AsQueryable()
+                .FirstOrDefaultAsync(u => u.Username == identifier || u.Email.Value == identifier);
+
+            if (user == null)
+                return null;
+
+            var code = GenerateVerificationCode();
+            var expiry = DateTime.UtcNow.AddMinutes(5);
+
+            user.SetVerificationCode(code, expiry);
+
+            var userWriteRepository = _unitOfWork.GetWriteRepository<User>();
+            userWriteRepository.Update(user);
+            await _unitOfWork.CompleteAsync();
+
+            if (InputValidator.IsEmail(identifier))
+            {
+                await _emailProvider.SendVerificationCodeAsync(identifier, code);
+            }
+            else if (InputValidator.IsPhoneNumber(identifier))
+            {
+                await _smsProvider.SendVerificationCodeAsync(identifier, code);
+            }
+
+            return code;
+        }
+
+        public async Task<bool> ResetPasswordAsync(string identifier, string newPassword, string verificationCode)
+        {
+            var userReadRepository = _unitOfWork.GetReadRepository<User>();
+            var user = await userReadRepository.AsQueryable()
+                .FirstOrDefaultAsync(u => u.Username == identifier || u.Email.Value == identifier);
+
+            if (user == null || user.VerificationCode != verificationCode || user.VerificationCodeExpiry < DateTime.UtcNow)
+                return false;
+
+            byte[] passwordHash, passwordSalt;
+            User.CreatePasswordHash(newPassword, out passwordHash, out passwordSalt);
+
+            user.UpdatePassword(passwordHash, passwordSalt);
+            user.SetVerificationCode(null, DateTime.UtcNow);
+
+            var userWriteRepository = _unitOfWork.GetWriteRepository<User>();
+            userWriteRepository.Update(user);
+            await _unitOfWork.CompleteAsync();
+
+            return true;
+        }
+
+        private string GenerateVerificationCode()
+        {
+            var random = new Random();
+            return random.Next(100000, 999999).ToString();
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Security\IEmailProvider.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Infrastructure.Security
+{
+    public interface IEmailProvider
+    {
+        Task SendVerificationCodeAsync(string email, string code);
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Security\IForgotPasswordService.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Infrastructure.Security
+{
+    public interface IForgotPasswordService
+    {
+        Task<string> SendPasswordResetCodeAsync(string identifier);
+        Task<bool> ResetPasswordAsync(string identifier, string newPassword, string verificationCode);
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Security\ISmsProvider.cs
+
+using System.Threading.Tasks;
+
+namespace Infrastructure.Security
+{
+    public interface ISmsProvider
+    {
+        Task SendVerificationCodeAsync(string recipient, string code);
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Security\JwtTokenService.cs
+
+using Domain.Entities;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Security.Cryptography;
+using System.Text;
+using UnitOfWork;
+using UnitOfWork.Repositories;
+
+namespace Infrastructure.Security
+{
+    public class JwtTokenService
+    {
+        private readonly string _secret;
+        private readonly string _issuer;
+        private readonly string _audience;
+        //
+        private readonly Dictionary<string, string> _refreshTokens = new Dictionary<string, string>();
+        private readonly IUnitOfWork _unitOfWork;
+        private IWriteRepository<User> _userWriteRepository => _unitOfWork.GetWriteRepository<User>();
+
+        private IReadRepository<User> _userReadRepository => _unitOfWork.GetReadRepository<User>();
+        private IWriteRepository<RefreshToken> _refreshTokenWriteRepository => _unitOfWork.GetWriteRepository<RefreshToken>();
+        private IReadRepository<RefreshToken> _refreshTokenReadRepository => _unitOfWork.GetReadRepository<RefreshToken>();
+
+
+        public JwtTokenService(string secret, string issuer, string audience, IUnitOfWork unitOfWork)
+        {
+            _secret = secret;
+            _issuer = issuer;
+            _audience = audience;
+            _unitOfWork = unitOfWork; 
+        }
+
+        public string GenerateToken(User user)
+        {
+            var claims = new[]
+            {
+        new Claim(JwtRegisteredClaimNames.Sub, user.Id.ToString()),
+        new Claim(JwtRegisteredClaimNames.UniqueName, user.Username),
+        new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
+    };
+
+            var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_secret));
+            var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+            var token = new JwtSecurityToken(
+                issuer: _issuer,
+                audience: _audience,
+                claims: claims,
+                expires: DateTime.UtcNow.AddMinutes(30),
+                signingCredentials: creds);
+
+            return new JwtSecurityTokenHandler().WriteToken(token);
+        }
+        public async Task RevokeToken(string token)
+        {
+            _refreshTokens.Remove(token);
+        }
+
+        public async Task<string> RefreshToken(string token)
+        {
+            if (_refreshTokens.ContainsKey(token))
+            {
+                var userId = _refreshTokens[token];
+                var user = await GetUserById(Guid.Parse(userId));
+                return GenerateToken(user);
+            }
+
+            throw new SecurityTokenException("Invalid token.");
+        }
+
+ 
+        private async Task<User> GetUserById(Guid userId)
+        {
+            var userReadRepository = _unitOfWork.GetReadRepository<User>();
+            var user = await userReadRepository.GetByIdAsync(userId);
+
+            if (user == null)
+            {
+                throw new SecurityTokenException("User not found.");
+            }
+
+            return user;
+        }
+
+        public async Task<string> GenerateRefreshToken(User user)
+        {
+            var randomNumber = new byte[32];
+            using var rng = RandomNumberGenerator.Create(); 
+            rng.GetBytes(randomNumber);
+
+            var refreshToken = Convert.ToBase64String(randomNumber);
+            var refreshTokenEntity = new RefreshToken(refreshToken, DateTime.UtcNow.AddDays(7), user.Id);
+            
+            user.AddRefreshToken(refreshTokenEntity);
+
+
+            await _refreshTokenWriteRepository.AddAsync(refreshTokenEntity);
+
+            return refreshToken;
+        }
+
+
+        public async Task<string> RefreshToken(string token, string refreshToken)
+        {
+            var userReadRepository = _unitOfWork.GetReadRepository<User>();
+            var user = await userReadRepository.AsQueryable()
+                .Include(u => u.RefreshTokens)
+                .FirstOrDefaultAsync(u => u.RefreshTokens.Any(rt => rt.Token == refreshToken));
+
+            if (user == null || user.RefreshTokens.Single(rt => rt.Token == refreshToken).IsExpired)
+            {
+                throw new SecurityTokenException("Invalid refresh token.");
+            }
+
+            var newJwtToken = GenerateToken(user);
+            var newRefreshToken = GenerateRefreshToken(user);
+
+            user.RemoveRefreshToken(refreshToken);
+            await _unitOfWork.CompleteAsync();
+
+            return newJwtToken;
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Security\MultiFactorAuthenticationService.cs
+
+using Domain.Entities;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Infrastructure.Security
+{
+    public class MultiFactorAuthenticationService
+    {
+        private readonly Dictionary<string, string> _mfaCodes = new Dictionary<string, string>();
+
+        public async Task SendMfaCode(User user)
+        {
+            var code = GenerateMfaCode();
+            _mfaCodes[user.Username] = code;
+           
+        }
+
+        public bool VerifyMfaCode(User user, string code)
+        {
+            return _mfaCodes.ContainsKey(user.Username) && _mfaCodes[user.Username] == code;
+        }
+
+        private string GenerateMfaCode()
+        {
+            var random = new Random();
+            return random.Next(100000, 999999).ToString();
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Security\SecurityService.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Infrastructure.Security
+{
+    public class SecurityService
+    {
+        public void EncryptSensitiveData(ref string data)
+        {
+            data = Convert.ToBase64String(Encoding.UTF8.GetBytes(data));
+        }
+
+        public void DecryptSensitiveData(ref string data)
+        {
+            data = Encoding.UTF8.GetString(Convert.FromBase64String(data)); 
+        }
+
+        public void LogSecurityEvent(string eventType, string details)
+        {
+            Console.WriteLine($"Security Event: {eventType}, Details: {details}"); 
+        }
+
+        public void EnforceRateLimiting(string key)
+        {
+            
+        }
+
+        public void DetectAndPreventBruteForce(string key)
+        {
+            
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Infrastructure\Security\SmsProviderFactory.cs
+
+
+namespace Infrastructure.Security
+{
+    public static class SmsProviderFactory
+    {
+        public static ISmsProvider CreateProvider()
+        {
+        
+            return new FakeSmsProvider();
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Program.cs
+
+using Application.ApplicationServices;
+using Infrastructure.Persistence;
+using Infrastructure.Security;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using System.Text;
+using UnitOfWork;
+using UnitOfWork.Repositories;
+using Infrastructure.Persistence.Repositories;
+using Infrastructure.Persistence.Repositories.Data_Seeder;
+using ProtoBuf.Meta;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.Extensions.Hosting;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowAll", policy =>
+    {
+        policy.AllowAnyOrigin()
+              .AllowAnyHeader()
+              .AllowAnyMethod();
+    });
+});
+
+builder.Services.AddScoped(typeof(IReadRepository<>), typeof(BaseReadRepository<>));
+builder.Services.AddScoped(typeof(IWriteRepository<>), typeof(BaseWriteRepository<>));
+
+
+builder.Services.AddScoped<IUnitOfWork, Infrastructure.Persistence.Repositories.UnitOfWork>();
+
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+builder.Services.AddIdentity<IdentityUser, IdentityRole>()
+    .AddEntityFrameworkStores<AppDbContext>()
+    .AddDefaultTokenProviders();
+
+builder.Services.AddScoped<AuthenticationApplicationService>();
+builder.Services.AddScoped<AuthenticationService>();
+builder.Services.AddScoped<TenantApplicationService>();
+builder.Services.AddScoped<TenantApplicationService>();
+builder.Services.AddScoped<RoleApplicationService>();
+builder.Services.AddScoped<PermissionApplicationService>();
+builder.Services.AddScoped<UserProfileApplicationService>();
+builder.Services.AddScoped<MultiFactorAuthenticationService>();
+builder.Services.AddScoped<SecurityService>();
+builder.Services.AddScoped<RoleBasedAccessControl>();
+builder.Services.AddSingleton<ISmsProvider, FakeSmsProvider>();
+builder.Services.AddScoped<IEmailProvider, FakeEmailProvider>();
+builder.Services.AddScoped<IForgotPasswordService, ForgotPasswordService>();
+builder.Services.AddScoped<OtpService>();
+
+
+
+
+builder.Services.AddControllers();
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+builder.Services.AddMemoryCache();
+
+
+
+
+var jwtSettings = builder.Configuration.GetSection("Jwt");
+var jwtKey = jwtSettings["Key"] ?? throw new InvalidOperationException("JWT Key is missing in configuration.");
+
+
+builder.Services.AddScoped(provider =>
+{
+    var jwtSettings = builder.Configuration.GetSection("Jwt");
+    var jwtKey = jwtSettings["Key"] ?? throw new InvalidOperationException("JWT Key is missing in configuration.");
+    var issuer = jwtSettings["Issuer"];
+    var audience = jwtSettings["Audience"];
+    var unitOfWork = provider.GetRequiredService<IUnitOfWork>();
+    return new JwtTokenService(jwtKey, issuer, audience, unitOfWork);
+});
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = jwtSettings["Issuer"],
+            ValidAudience = jwtSettings["Audience"],
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey))
+        };
+    });
+
+
+
+
+var app = builder.Build();
+
+app.UseCors("AllowAll");
+
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+app.Use(async (context, next) =>
+{
+    if (context.Request.Path == "/")
+    {
+        context.Response.Redirect("/swagger");
+        return;
+    }
+    await next();
+});
+
+using (var scope = app.Services.CreateScope())
+{
+    var rbac = scope.ServiceProvider.GetRequiredService<RoleBasedAccessControl>();
+    app.UseMiddleware<RoleValidationMiddleware>(rbac);
+}
+using (var scope = app.Services.CreateScope())
+{
+    var services = scope.ServiceProvider;
+    var roleService = services.GetRequiredService<RoleApplicationService>();
+    var authService = services.GetRequiredService<AuthenticationApplicationService>();
+
+    await roleService.CreateAdminRole();
+    await authService.SeedAdminUser();
+}
+
+app.UseHttpsRedirection();
+app.UseRouting();
+app.UseAuthentication();
+app.UseAuthorization();
+app.MapControllers();
+
+app.Run();
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Attributes\RequiredPermissionAttribute .cs
+
+using System;
+
+[AttributeUsage(AttributeTargets.Method | AttributeTargets.Class, AllowMultiple = false)]
+public class RequiredPermissionAttribute : Attribute
+{
+    public string Permission { get; }
+
+    public RequiredPermissionAttribute(string permission)
+    {
+        Permission = permission;
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Controllers\AuthenticationController.cs
+
+using Application.ApplicationServices;
+using Application.DTOs;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using System;
+using System.Threading.Tasks;
+using SharedDomain;
+using Azure;
+using System.Text.Json;
+using Presentation.DTOs;
+using SharedDomain.Common;
+
+namespace Presentation.Controllers
+{
+    [Route("/api/[controller]")]
+    [ApiController]
+    public class AuthenticationController : ControllerBase
+    {
+        private readonly AuthenticationApplicationService _authenticationService;
+
+        public AuthenticationController(AuthenticationApplicationService authenticationService)
+        {
+            _authenticationService = authenticationService;
+        }
+
+
+        [HttpPost("login")]
+        public async Task<ActionResult<BaseResponse<LoginResponseDTO>>> Login([FromBody] LoginDTO request)
+        {
+            try
+            {
+                var response = await _authenticationService.Login(request);
+                return StatusCode(response.ResponseCode, response);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<LoginResponseDTO>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+
+        [HttpPost("logout")]
+        public async Task<ActionResult<BaseResponse<string>>> Logout([FromBody] LogoutDTO request)
+        {
+            try
+            {
+                var response = await _authenticationService.Logout(request);
+                return StatusCode(response.ResponseCode, response);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<string>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+
+        [HttpPost("register")]
+        public async Task<ActionResult<BaseResponse<string>>> Register([FromBody] RegisterRequest request)
+        {
+            try
+            {              
+                var response = await _authenticationService.Register(request.UserName);
+
+                return StatusCode(response.ResponseCode, response);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<string>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+
+
+
+        [HttpPost("VerifyMultiFactorAuthentication")]
+        public async Task<ActionResult<BaseResponse<string>>> VerifyMultiFactorAuthentication([FromBody] VerifyMfaRequest request)
+        {
+            try
+            {
+                var token = await _authenticationService.VerifyMfa(request.Username, request.MfaCode);
+                return Ok(BaseResponse<string>.SuccessResponse(token, SuccessMessages.MfaVerified));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<string>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+
+
+
+
+
+        [HttpPost("RevokeToken")]
+        public async Task<ActionResult<BaseResponse<object>>> RevokeToken([FromBody] RevokeTokenRequest request)
+        {
+            try
+            {
+                await _authenticationService.RevokeToken(request.Token);
+                return Ok(BaseResponse<object>.SuccessResponse(null, SuccessMessages.TokenRevoked));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+
+        [HttpPost("refresh")]
+        public async Task<ActionResult<BaseResponse<LoginResponseDTO>>> RefreshToken([FromBody] RefreshTokenDTO request)
+        {
+            try
+            {
+                var response = await _authenticationService.RefreshToken(request);
+                return StatusCode(response.ResponseCode, response);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<LoginResponseDTO>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Controllers\ForgotPasswordController.cs
+
+using Application.DTOs;
+using Infrastructure.Security;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using SharedDomain;
+using SharedDomain.Common;
+
+namespace Presentation.Controllers
+{
+    [Route("[controller]")]
+    [ApiController]
+    public class ForgotPasswordController : ControllerBase
+    {
+        private readonly IForgotPasswordService _forgotPasswordService;
+
+        public ForgotPasswordController(IForgotPasswordService forgotPasswordService)
+        {
+            _forgotPasswordService = forgotPasswordService;
+        }
+
+        [HttpPost("SendResetCode")]
+        public async Task<ActionResult<BaseResponse<object>>> SendResetCode([FromBody] ForgotPasswordRequest request)
+        {
+            try
+            {
+                var result = await _forgotPasswordService.SendPasswordResetCodeAsync(request.Identifier);
+                if (result is not null)
+                {
+                    return Ok(BaseResponse<object>.SuccessResponse(result, "ResetCodeSent" /*SuccessMessages.ResetCodeSent*/));
+                }
+                else
+                {
+                    return BadRequest(BaseResponse<object>.ErrorResponse("UserNotFound"/*ErrorMessages.UserNotFound*/, 400));
+                }
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+
+        [HttpPost("ResetPassword")]
+        public async Task<ActionResult<BaseResponse<object>>> ResetPassword([FromBody] ResetPasswordRequest request)
+        {
+            try
+            {
+                var result = await _forgotPasswordService.ResetPasswordAsync(request.Identifier, request.NewPassword, request.VerificationCode);
+                if (result)
+                {
+                    return Ok(BaseResponse<object>.SuccessResponse(null, "PasswordResetSuccess"/* SuccessMessages.PasswordResetSuccess*/));
+                }
+                else
+                {
+                    return BadRequest(BaseResponse<object>.ErrorResponse("InvalidResetCode"/*ErrorMessages.InvalidResetCode*/, 400));
+                }
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Controllers\OtpController.cs
+
+
+using Application.ApplicationServices;
+using Application.DTOs;
+using Microsoft.AspNetCore.Mvc;
+using System;
+using System.Threading.Tasks;
+using SharedDomain;
+using static System.Net.WebRequestMethods;
+using SharedDomain.Common;
+
+namespace Presentation.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    public class OtpController : ControllerBase
+    {
+        private readonly OtpService _otpService;
+        private readonly AuthenticationApplicationService _authenticationService;
+
+
+        public OtpController(OtpService otpService, AuthenticationApplicationService authenticationService)
+        {
+            _otpService = otpService;
+            _authenticationService = authenticationService;
+
+        }
+
+        [HttpPost("generate")]
+        public async Task<ActionResult<BaseResponse<object>>> GenerateOtp([FromBody] GenerateOtpRequest request)
+        {
+            try
+            {
+
+
+                if (Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") == "Development")
+                {
+                     var otp = await _otpService.GenerateOtpByUsenName(request.UserName);
+                    return Ok(BaseResponse<object>.SuccessResponse(otp, "Verification code sent successfully."));
+
+                }
+                return Ok(BaseResponse<object>.SuccessResponse(null, "Verification code sent successfully."));
+
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse(ex.Message, 500));
+            }
+        }
+
+
+
+        [HttpPost("verify-otp")]
+        public async Task<ActionResult<BaseResponse<LoginResponseDTO>>> VerifyOtp([FromBody] VerifyOtpRequest request)
+        {
+            try
+            {
+                var loginDTO = new LoginDTO
+                {
+                    Username = request.Username,
+                    Password = "defaultPassword",
+                    DeviceToken = request.DeviceToken,
+                    DeviceId = request.DeviceId,
+                    ClientId = request.ClientId,
+                    ClientSecret = request.ClientSecret
+                };
+
+                var response = await _authenticationService.VerifyOtp(request.Username, request.Otp, loginDTO);
+                return StatusCode(response.ResponseCode, response);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<LoginResponseDTO>.ErrorResponse(ex.Message, 500));
+            }
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Controllers\PermissionsController.cs
+
+using Microsoft.AspNetCore.Mvc;
+using System;
+using System.Threading.Tasks;
+using Domain.Entities;
+using Application.ApplicationServices;
+using Application.DTOs;
+using SharedDomain.Common;
+using SharedDomain;
+using Microsoft.AspNetCore.Authorization;
+
+[ApiController]
+[Route("[controller]")]
+[Authorize(Policy = "ManagePermissions")]
+
+public class PermissionsController : ControllerBase
+{
+    private readonly PermissionApplicationService _permissionService;
+
+    public PermissionsController(PermissionApplicationService permissionService)
+    {
+        _permissionService = permissionService;
+    }
+
+  
+    [HttpGet()]
+    public async Task<ActionResult<BaseResponse<PagedResult<Permission>>>> GetPermissions(int pageNumber = 1, int pageSize = 10)
+    {
+        try
+        {
+            var result = await _permissionService.GetPermissionsPaginatedAsync(pageNumber, pageSize);
+            return Ok(BaseResponse<PagedResult<Permission>>.SuccessResponse(result, SuccessMessages.RetrievedSuccessfully));
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, BaseResponse<PagedResult<Permission>>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+        }
+    }
+
+
+    [HttpGet("{id}")]
+    public async Task<ActionResult<BaseResponse<Permission>>> GetPermission(Guid id)
+    {
+        try
+        {
+            var permission = await _permissionService.GetPermissionByIdAsync(id);
+            if (permission == null)
+            {
+                return NotFound(BaseResponse<Permission>.ErrorResponse(ErrorMessages.NotFound, 404));
+            }
+            return Ok(BaseResponse<Permission>.SuccessResponse(permission, SuccessMessages.RetrievedSuccessfully));
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, BaseResponse<Permission>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+        }
+    }
+
+  
+    [HttpPost()]
+    [RequiredPermission("ManageRoles")]
+    public async Task<ActionResult<BaseResponse<Permission>>> CreatePermission([FromBody] CreatePermissionRequest request)
+    {
+        try
+        {
+            if (!ModelState.IsValid)
+            {
+                return BadRequest(BaseResponse<Permission>.ErrorResponse(ErrorMessages.InvalidInput, 400));
+            }
+
+            var permission = await _permissionService.CreatePermissionAsync(request.Name, request.UserType);
+            return CreatedAtAction(nameof(GetPermission), new { id = permission.Id }, BaseResponse<Permission>.SuccessResponse(permission, "Permission created successfully", 201));
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, BaseResponse<Permission>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+        }
+    }
+
+   
+    [HttpPut("{id}")]
+    public async Task<ActionResult<BaseResponse<object>>> UpdatePermission(Guid id, [FromBody] UpdatePermissionRequest request)
+    {
+        try
+        {
+            if (!ModelState.IsValid)
+            {
+                return BadRequest(BaseResponse<object>.ErrorResponse(ErrorMessages.InvalidInput, 400));
+            }
+
+            var permission = await _permissionService.GetPermissionByIdAsync(id);
+            if (permission == null)
+            {
+                return NotFound(BaseResponse<object>.ErrorResponse(ErrorMessages.NotFound, 404));
+            }
+
+            permission.Name = request.Name;
+            permission.UserType = request.UserType;
+
+            await _permissionService.UpdatePermissionAsync(permission);
+            return Ok(BaseResponse<object>.SuccessResponse(null, SuccessMessages.UpdatedSuccessfully));
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, BaseResponse<object>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+        }
+    }
+
+
+    [HttpDelete("{id}")]
+    public async Task<ActionResult<BaseResponse<object>>> DeletePermission(Guid id)
+    {
+        try
+        {
+            var permission = await _permissionService.GetPermissionByIdAsync(id);
+            if (permission == null)
+            {
+                return NotFound(BaseResponse<object>.ErrorResponse(ErrorMessages.NotFound, 404));
+            }
+
+            await _permissionService.DeletePermissionAsync(id);
+            return Ok(BaseResponse<object>.SuccessResponse(null, SuccessMessages.DeletedSuccessfully));
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, BaseResponse<object>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Controllers\RoleController.cs
+
+using Application.ApplicationServices;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using System;
+using System.Threading.Tasks;
+using Application.DTOs;
+using SharedDomain.Common;
+using Domain.Entities;
+using SharedDomain;
+using Domain.ValueObjects;
+using System.Security.Claims;
+using Microsoft.AspNetCore.Authorization;
+
+namespace Presentation.Controllers
+{
+    [Route("[controller]")]
+    [ApiController]
+    [Authorize(Policy = "ManageRoles")]
+
+    public class RoleController : ControllerBase
+    {
+        private readonly RoleApplicationService _roleApplicationService;
+
+        public RoleController(RoleApplicationService roleApplicationService)
+        {
+            _roleApplicationService = roleApplicationService;
+        }
+
+      
+        [HttpGet()]
+        public async Task<ActionResult<BaseResponse<PagedResult<Role>>>> GetRoles(int pageNumber = 1, int pageSize = 10)
+        {
+            try
+            {
+                var result = await _roleApplicationService.GetRolesPaginatedAsync(pageNumber, pageSize);
+                return Ok(BaseResponse<PagedResult<Role>>.SuccessResponse(result, SuccessMessages.RetrievedSuccessfully));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<PagedResult<Role>>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+
+        [HttpGet("{id}")]
+        public async Task<ActionResult<BaseResponse<Role>>> GetRole(Guid id)
+        {
+            try
+            {
+                var role = await _roleApplicationService.GetRoleByIdAsync(id);
+                if (role == null)
+                {
+                    return NotFound(BaseResponse<Role>.ErrorResponse(ErrorMessages.NotFound, 404));
+                }
+                return Ok(BaseResponse<Role>.SuccessResponse(role, SuccessMessages.RetrievedSuccessfully));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<Role>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+
+        [HttpPost()]
+        public async Task<ActionResult<BaseResponse<object>>> Create([FromBody] CreateRoleRequest request)
+        {
+            try
+            {
+                
+                var userRole = GetCurrentUserRole(); 
+
+                await _roleApplicationService.CreateRole(request.TenantId, request.RoleName, request.UserType, request.isSystem, request.Permissions, request.localizations, userRole);
+                return Ok(BaseResponse<object>.SuccessResponse(null, SuccessMessages.CreatedSuccessfully));
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                return StatusCode(403, BaseResponse<object>.ErrorResponse(ex.Message, 403));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+
+        private TenantRole GetCurrentUserRole()
+        {
+           
+            var roleClaim = HttpContext.User.Claims.FirstOrDefault(c => c.Type == ClaimTypes.Role);
+            if (roleClaim != null && Enum.TryParse(roleClaim.Value, out TenantRole role))
+            {
+                return role;
+            }
+            throw new UnauthorizedAccessException("User role not found.");
+        }
+
+        [HttpPut()]
+        public async Task<ActionResult<BaseResponse<object>>> Update([FromBody] UpdateRolePermissionsRequest request)
+        {
+            try
+            {
+                await _roleApplicationService.UpdateRolePermissions(request.RoleId, request.Permissions);
+                return Ok(BaseResponse<object>.SuccessResponse(null, SuccessMessages.UpdatedSuccessfully));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+
+      
+        [HttpDelete()]
+        public async Task<ActionResult<BaseResponse<object>>> Delete([FromBody] DeleteRoleRequest request)
+        {
+            try
+            {
+                await _roleApplicationService.DeleteRole(request.RoleId);
+                return Ok(BaseResponse<object>.SuccessResponse(null, SuccessMessages.DeletedSuccessfully));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Controllers\TenantController.cs
+
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Application.ApplicationServices;
+using Application.DTOs;
+using SharedDomain.Common;
+using Domain.Entities;
+
+using SharedDomain;
+using Microsoft.AspNetCore.Authorization;
+
+namespace Presentation.Controllers
+{
+
+    [ApiController]
+    [Route("[controller]")]
+    [RequiredPermission("ManageTenants")]
+    public class TenantController : ControllerBase
+    {
+        private readonly TenantApplicationService _tenantApplicationService;
+
+        public TenantController(TenantApplicationService tenantApplicationService)
+        {
+            _tenantApplicationService = tenantApplicationService;
+        }
+
+     
+        [HttpGet()]
+        public async Task<ActionResult<BaseResponse<PagedResult<Tenant>>>> GetTenants(int pageNumber = 1, int pageSize = 10)
+        {
+            try
+            {
+                var result = await _tenantApplicationService.GetTenantsPaginatedAsync(pageNumber, pageSize);
+                return Ok(BaseResponse<PagedResult<Tenant>>.SuccessResponse(result, SuccessMessages.RetrievedSuccessfully));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<PagedResult<Tenant>>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+
+      
+        [HttpPost()]
+        public async Task<ActionResult<BaseResponse<object>>> Create([FromBody] CreateTenantRequest request)
+        {
+            try
+            {
+                await _tenantApplicationService.CreateTenant(request);
+                return Ok(BaseResponse<object>.SuccessResponse(null, SuccessMessages.CreatedSuccessfully));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+
+        [HttpPut()]
+        public async Task<ActionResult<BaseResponse<object>>> Update([FromBody] UpdateTenantRequest request)
+        {
+            try
+            {
+                await _tenantApplicationService.UpdateTenant(request);
+                return Ok(BaseResponse<object>.SuccessResponse(null, SuccessMessages.UpdatedSuccessfully));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+
+   
+        [HttpDelete()]
+        public async Task<ActionResult<BaseResponse<object>>> Delete([FromBody] DeleteTenantRequest request)
+        {
+            try
+            {
+                await _tenantApplicationService.DeleteTenant(request);
+                return Ok(BaseResponse<object>.SuccessResponse(null, SuccessMessages.DeletedSuccessfully));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Controllers\UserProfileController.cs
+
+using Application.ApplicationServices;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using System;
+using System.Threading.Tasks;
+using Application.DTOs;
+using SharedDomain.Common;
+using SharedDomain;
+using Microsoft.AspNetCore.Authorization;
+
+namespace Presentation.Controllers
+{
+    [Route("[controller]")]
+    [ApiController]
+    [Authorize(Policy = "ManageUsers")]
+    public class UserProfileController : ControllerBase
+    {
+        private readonly UserProfileApplicationService _userProfileApplicationService;
+
+        public UserProfileController(UserProfileApplicationService userProfileApplicationService)
+        {
+            _userProfileApplicationService = userProfileApplicationService;
+        }
+
+     
+        [HttpPut("UpdateProfile")]
+        public async Task<ActionResult<BaseResponse<object>>> UpdateProfile([FromBody] UpdateUserProfileRequest request)
+        {
+            try
+            {
+                await _userProfileApplicationService.UpdateUserProfile(request.UserId, request.NewEmail, request.NewUsername);
+                return Ok(BaseResponse<object>.SuccessResponse(null, SuccessMessages.UpdatedSuccessfully));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+
+   
+        [HttpPut("UpdatePassword")]
+        public async Task<ActionResult<BaseResponse<object>>> UpdatePassword([FromBody] UpdatePasswordRequest request)
+        {
+            try
+            {
+                await _userProfileApplicationService.UpdatePassword(request.UserId, request.NewPassword);
+                return Ok(BaseResponse<object>.SuccessResponse(null, SuccessMessages.UpdatedSuccessfully));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+
+    
+        [HttpPut("EnableMultiFactorAuthentication")]
+        public async Task<ActionResult<BaseResponse<object>>> EnableMultiFactorAuthentication([FromBody] EnableMultiFactorAuthenticationRequest request)
+        {
+            try
+            {
+                await _userProfileApplicationService.EnableMultiFactorAuthentication(request.UserId, request.SecretKey);
+                return Ok(BaseResponse<object>.SuccessResponse(null, SuccessMessages.MfaEnabledSuccessfully));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+
+   
+        [HttpPut("DisableMultiFactorAuthentication")]
+        public async Task<ActionResult<BaseResponse<object>>> DisableMultiFactorAuthentication([FromBody] DisableMultiFactorAuthenticationRequest request)
+        {
+            try
+            {
+                await _userProfileApplicationService.DisableMultiFactorAuthentication(request.UserId);
+                return Ok(BaseResponse<object>.SuccessResponse(null, SuccessMessages.MfaDisabledSuccessfully));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, BaseResponse<object>.ErrorResponse($"{ErrorMessages.InternalServerError}: {ex.Message}", 500));
+            }
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\DTOs\CreateTenantResponse.cs
+
+namespace Presentation.DTOs
+{
+    public class CreateTenantResponse
+    {
+        public string TenantId { get; set; }
+        public string TenantName { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\DTOs\RegisterUserResponse.cs
+
+namespace Presentation.DTOs
+{
+    public class RegisterUserResponse
+    {
+        public required string UserId { get; set; }
+        public required string Username { get; set; }
+        public required string Email { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\DTOs\TokenResponse.cs
+
+namespace Presentation.DTOs
+{
+    public class TokenResponse
+    {
+        public string Token { get; set; }
+        public string RefreshToken { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Middleware\RoleValidationMiddleware.cs
+
+
+using Microsoft.AspNetCore.Http;
+using System.Threading.Tasks;
+using SharedDomain.Common;
+using Domain.ValueObjects;
+using System.Security.Claims;
+
+public class RoleValidationMiddleware
+{
+    private readonly RequestDelegate _next;
+    private readonly RoleBasedAccessControl _rbac;
+
+    public RoleValidationMiddleware(RequestDelegate next, RoleBasedAccessControl rbac)
+    {
+        _next = next;
+        _rbac = rbac;
+    }
+
+    public async Task InvokeAsync(HttpContext context)
+    {
+        
+        var userRoleClaim = context.User.Claims.FirstOrDefault(c => c.Type == ClaimTypes.Role)?.Value;
+        if (userRoleClaim != null && Enum.TryParse(userRoleClaim, out TenantRole userRole))
+        {
+            
+            var endpoint = context.GetEndpoint();
+            if (endpoint != null)
+            {
+                var requiredPermission = endpoint.Metadata.GetMetadata<RequiredPermissionAttribute>()?.Permission;
+                if (requiredPermission != null && !_rbac.HasPermission(userRole, requiredPermission))
+                {
+                    context.Response.StatusCode = 403; 
+                    await context.Response.WriteAsync("You do not have permission to perform this action.");
+                    return;
+                }
+            }
+        }
+
+       
+        await _next(context);
+    }
+}
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Models\TenantModel.cs
+
+namespace Presentation.Models
+{
+    public class TenantModel
+    {
+        public string TenantId { get; set; }
+        public string TenantName { get; set; }
+        public List<UserModel> Users { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\Presentation\Models\UserModel.cs
+
+namespace Presentation.Models
+{
+    public class UserModel
+    {
+        public string UserId { get; set; }
+        public string Username { get; set; }
+        public string Email { get; set; }
+        public List<TenantModel> Tenants { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\SharedDomainLayer\ErrorMessages.Designer.cs
+
+//------------------------------------------------------------------------------
+// <auto-generated>
+//     This code was generated by a tool.
+//     Runtime Version:4.0.30319.42000
+//
+//     Changes to this file may cause incorrect behavior and will be lost if
+//     the code is regenerated.
+// </auto-generated>
+//------------------------------------------------------------------------------
+
+namespace SharedDomain {
+    using System;
+    
+    
+    /// <summary>
+    ///   A strongly-typed resource class, for looking up localized strings, etc.
+    /// </summary>
+    // This class was auto-generated by the StronglyTypedResourceBuilder
+    // class via a tool like ResGen or Visual Studio.
+    // To add or remove a member, edit your .ResX file then rerun ResGen
+    // with the /str option, or rebuild your VS project.
+    [global::System.CodeDom.Compiler.GeneratedCodeAttribute("System.Resources.Tools.StronglyTypedResourceBuilder", "17.0.0.0")]
+    [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+    [global::System.Runtime.CompilerServices.CompilerGeneratedAttribute()]
+    public class ErrorMessages {
+        
+        private static global::System.Resources.ResourceManager resourceMan;
+        
+        private static global::System.Globalization.CultureInfo resourceCulture;
+        
+        [global::System.Diagnostics.CodeAnalysis.SuppressMessageAttribute("Microsoft.Performance", "CA1811:AvoidUncalledPrivateCode")]
+        public ErrorMessages() {
+        }
+        
+        /// <summary>
+        ///   Returns the cached ResourceManager instance used by this class.
+        /// </summary>
+        [global::System.ComponentModel.EditorBrowsableAttribute(global::System.ComponentModel.EditorBrowsableState.Advanced)]
+        internal static global::System.Resources.ResourceManager ResourceManager {
+            get {
+                if (object.ReferenceEquals(resourceMan, null)) {
+                    global::System.Resources.ResourceManager temp = new global::System.Resources.ResourceManager("SharedDomain.ErrorMessages", typeof(ErrorMessages).Assembly);
+                    resourceMan = temp;
+                }
+                return resourceMan;
+            }
+        }
+        
+        /// <summary>
+        ///   Overrides the current thread's CurrentUICulture property for all
+        ///   resource lookups using this strongly typed resource class.
+        /// </summary>
+        [global::System.ComponentModel.EditorBrowsableAttribute(global::System.ComponentModel.EditorBrowsableState.Advanced)]
+        internal static global::System.Globalization.CultureInfo Culture {
+            get {
+                return resourceCulture;
+            }
+            set {
+                resourceCulture = value;
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Internal server error occurred. .
+        /// </summary>
+         public static string InternalServerError {
+            get {
+                return ResourceManager.GetString("InternalServerError", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Invalid username or password. .
+        /// </summary>
+         public static string InvalidCredentials {
+            get {
+                return ResourceManager.GetString("InvalidCredentials", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Invalid input. .
+        /// </summary>
+         public static string InvalidInput {
+            get {
+                return ResourceManager.GetString("InvalidInput", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to MFA code is required. .
+        /// </summary>
+         public static string MfaCodeRequired {
+            get {
+                return ResourceManager.GetString("MfaCodeRequired", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Resource not found. .
+        /// </summary>
+         public static string NotFound {
+            get {
+                return ResourceManager.GetString("NotFound", resourceCulture);
+            }
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\SharedDomainLayer\SuccessMessages.Designer.cs
+
+//------------------------------------------------------------------------------
+// <auto-generated>
+//     This code was generated by a tool.
+//     Runtime Version:4.0.30319.42000
+//
+//     Changes to this file may cause incorrect behavior and will be lost if
+//     the code is regenerated.
+// </auto-generated>
+//------------------------------------------------------------------------------
+
+namespace SharedDomain {
+    using System;
+    
+    
+    /// <summary>
+    ///   A strongly-typed resource class, for looking up localized strings, etc.
+    /// </summary>
+    // This class was auto-generated by the StronglyTypedResourceBuilder
+    // class via a tool like ResGen or Visual Studio.
+    // To add or remove a member, edit your .ResX file then rerun ResGen
+    // with the /str option, or rebuild your VS project.
+    [global::System.CodeDom.Compiler.GeneratedCodeAttribute("System.Resources.Tools.StronglyTypedResourceBuilder", "17.0.0.0")]
+    [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+    [global::System.Runtime.CompilerServices.CompilerGeneratedAttribute()]
+    public class SuccessMessages {
+        
+        private static global::System.Resources.ResourceManager resourceMan;
+        
+        private static global::System.Globalization.CultureInfo resourceCulture;
+        
+        [global::System.Diagnostics.CodeAnalysis.SuppressMessageAttribute("Microsoft.Performance", "CA1811:AvoidUncalledPrivateCode")]
+        public SuccessMessages() {
+        }
+        
+        /// <summary>
+        ///   Returns the cached ResourceManager instance used by this class.
+        /// </summary>
+        [global::System.ComponentModel.EditorBrowsableAttribute(global::System.ComponentModel.EditorBrowsableState.Advanced)]
+        public static global::System.Resources.ResourceManager ResourceManager {
+            get {
+                if (object.ReferenceEquals(resourceMan, null)) {
+                    global::System.Resources.ResourceManager temp = new global::System.Resources.ResourceManager("SharedDomain.SuccessMessages", typeof(SuccessMessages).Assembly);
+                    resourceMan = temp;
+                }
+                return resourceMan;
+            }
+        }
+        
+        /// <summary>
+        ///   Overrides the current thread's CurrentUICulture property for all
+        ///   resource lookups using this strongly typed resource class.
+        /// </summary>
+        [global::System.ComponentModel.EditorBrowsableAttribute(global::System.ComponentModel.EditorBrowsableState.Advanced)]
+        public static global::System.Globalization.CultureInfo Culture {
+            get {
+                return resourceCulture;
+            }
+            set {
+                resourceCulture = value;
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Created successfully. .
+        /// </summary>
+        public static string CreatedSuccessfully {
+            get {
+                return ResourceManager.GetString("CreatedSuccessfully", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Deleted successfully. .
+        /// </summary>
+        public static string DeletedSuccessfully {
+            get {
+                return ResourceManager.GetString("DeletedSuccessfully", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Login successful..
+        /// </summary>
+        public static string LoginSuccessful {
+            get {
+                return ResourceManager.GetString("LoginSuccessful", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Multi-factor authentication disabled successfully. .
+        /// </summary>
+        public static string MfaDisabledSuccessfully {
+            get {
+                return ResourceManager.GetString("MfaDisabledSuccessfully", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Multi-factor authentication enabled successfully. .
+        /// </summary>
+        public static string MfaEnabledSuccessfully {
+            get {
+                return ResourceManager.GetString("MfaEnabledSuccessfully", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to MFA verification successful..
+        /// </summary>
+        public static string MfaVerified {
+            get {
+                return ResourceManager.GetString("MfaVerified", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Registration successful. please verify your account !.
+        /// </summary>
+        public static string RegistrationSuccess {
+            get {
+                return ResourceManager.GetString("RegistrationSuccess", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Retrieved successfully..
+        /// </summary>
+        public static string RetrievedSuccessfully {
+            get {
+                return ResourceManager.GetString("RetrievedSuccessfully", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Token refreshed successfully. .
+        /// </summary>
+        public static string TokenRefreshed {
+            get {
+                return ResourceManager.GetString("TokenRefreshed", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Token revoked successfully. .
+        /// </summary>
+        public static string TokenRevoked {
+            get {
+                return ResourceManager.GetString("TokenRevoked", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Updated successfully. .
+        /// </summary>
+        public static string UpdatedSuccessfully {
+            get {
+                return ResourceManager.GetString("UpdatedSuccessfully", resourceCulture);
+            }
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\SharedDomainLayer\UserType.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace SharedDomain
+{
+    public enum UserType
+    {
+        Admin,
+        Customer,
+        Collector
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\SharedDomainLayer\Common\BaseEntity.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace SharedDomain.Common
+{
+    public abstract class BaseEntity
+    {
+        public Guid Id { get;protected set; } = Guid.NewGuid();
+
+        public DateTime? CreatedAt { get;protected set; } = DateTime.UtcNow;
+        public DateTime? UpdatedAt { get;protected set; } = DateTime.UtcNow;
+        public string? CreatedBy   { get; protected set; }
+        public string? UpdatedBy   { get; protected set; }
+        public bool IsDeleted { get; set; } = false;
+  
+
+        protected void SetCreationProperties(string createdBy)
+        {
+
+            CreatedBy = createdBy;
+            UpdatedBy = createdBy;
+        }
+
+ 
+        protected void SetUpdateProperties(string updatedBy)
+        {
+            UpdatedBy = updatedBy;
+        }
+
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\SharedDomainLayer\Common\BaseResponse.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.Serialization;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace SharedDomain.Common
+{
+    [DataContract]
+    public class BaseResponse<T>
+    {
+        [DataMember(Order = 1)]
+        public int ResponseCode { get; set; }
+
+        [DataMember(Order = 2)]
+        public string ResponseMessage { get; set; }
+
+        [DataMember(Order = 3)]
+        public List<ValidationError>? ValidationList { get; set; }
+
+        [DataMember(Order = 4)]
+        public T? ResponseData { get; set; }
+
+        [DataMember(Order = 5)]
+        public int InternalCode { get; set; }
+
+        // Helper method for success responses
+        public static BaseResponse<T> SuccessResponse(T? data, string message, int responseCode = 200)
+        {
+            return new BaseResponse<T>
+            {
+                ResponseCode = responseCode,
+                ResponseMessage = message,
+                ResponseData = data,
+                ValidationList = null
+            };
+        }
+
+        // Helper method for error responses
+        public static BaseResponse<T> ErrorResponse(string message, int responseCode = 500)
+        {
+            return new BaseResponse<T>
+            {
+                ResponseCode = responseCode,
+                ResponseMessage = message,
+                ResponseData = default,
+                ValidationList = null
+            };
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\SharedDomainLayer\Common\IAggregateRoot.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace SharedDomain.Common
+{
+    public interface IAggregateRoot
+    {
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\SharedDomainLayer\Common\InputValidator.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+
+namespace SharedDomain.Common
+{
+    public static class InputValidator
+    {
+        private static readonly Regex EmailRegex = new Regex(@"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$");
+        private static readonly Regex PhoneRegex = new Regex(@"^(\+|00)?\d{6,15}$");
+
+        public static bool IsEmail(string input)
+        {
+            return EmailRegex.IsMatch(input);
+        }
+
+        public static bool IsPhoneNumber(string input)
+        {
+            return PhoneRegex.IsMatch(input);
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\SharedDomainLayer\Common\PagedResult.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace SharedDomain.Common
+{
+    public class PagedResult<T>
+    {
+        public List<T> Items { get; set; } 
+        public int TotalCount { get; set; } 
+        public int PageNumber { get; set; }
+        public int PageSize { get; set; }
+        public int TotalPages => (int)Math.Ceiling(TotalCount / (double)PageSize); 
+
+        public PagedResult(List<T> items, int totalCount, int pageNumber, int pageSize)
+        {
+            Items = items;
+            TotalCount = totalCount;
+            PageNumber = pageNumber;
+            PageSize = pageSize;
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\SharedDomainLayer\Common\ValidationError.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace SharedDomain.Common
+{
+    public class ValidationError
+    {
+        public string Field { get; set; }
+        public string Message { get; set; }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\UnitOfWork\IUnitOfWork.cs
+
+using Microsoft.EntityFrameworkCore.Storage;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using UnitOfWork.Repositories;
+
+namespace UnitOfWork
+{
+    public interface IUnitOfWork : IDisposable
+    {
+        IReadRepository<TEntity> GetReadRepository<TEntity>() where TEntity : BaseEntity;
+        IWriteRepository<TEntity> GetWriteRepository<TEntity>() where TEntity : BaseEntity;
+        Task<int> CompleteAsync();
+        Task<IDbContextTransaction> BeginTransactionAsync();
+        Task CommitTransactionAsync(IDbContextTransaction transaction);
+        void RollbackTransaction();
+        IDbContextTransaction? GetCurrentTransaction();
+        bool HasActiveTransaction { get; }
+        void Commit();
+        Task CommitAsync();
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\UnitOfWork\Context\ContextBase.cs
+
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using UnitOfWork.Repositories;
+
+namespace UnitOfWork.Context
+{
+    public abstract class ContextBase : DbContext, IUnitOfWork
+    {
+        private IDbContextTransaction? _currentTransaction;
+
+        protected ContextBase(DbContextOptions options) : base(options)
+        {
+        }
+
+        public IReadRepository<TEntity> GetReadRepository<TEntity>() where TEntity : BaseEntity
+        {
+            return new BaseReadRepository<TEntity>(Set<TEntity>());
+        }
+
+        public IWriteRepository<TEntity> GetWriteRepository<TEntity>() where TEntity : BaseEntity
+        {
+            return new BaseWriteRepository<TEntity>(Set<TEntity>(), this);
+        }
+
+        public IDbContextTransaction? GetCurrentTransaction() => _currentTransaction;
+
+        public bool HasActiveTransaction => _currentTransaction is not null;
+
+        public async Task<int> CompleteAsync()
+        {
+            return await SaveChangesAsync();
+        }
+
+        public async Task<IDbContextTransaction> BeginTransactionAsync()
+        {
+            if (_currentTransaction is not null) return _currentTransaction;
+
+            _currentTransaction = await Database.BeginTransactionAsync();
+            return _currentTransaction;
+        }
+
+        public async Task CommitTransactionAsync(IDbContextTransaction transaction)
+        {
+            if (transaction == null) throw new ArgumentNullException(nameof(transaction));
+            if (transaction != _currentTransaction) throw new InvalidOperationException($"Transaction {transaction.TransactionId} is not current");
+
+            try
+            {
+                await SaveChangesAsync();
+                await transaction.CommitAsync();
+            }
+            catch
+            {
+                RollbackTransaction();
+                throw;
+            }
+            finally
+            {
+                _currentTransaction?.Dispose();
+                _currentTransaction = null;
+            }
+        }
+
+        public void RollbackTransaction()
+        {
+            try
+            {
+                _currentTransaction?.Rollback();
+            }
+            finally
+            {
+                _currentTransaction?.Dispose();
+                _currentTransaction = null;
+            }
+        }
+
+        public void Commit() => SaveChanges();
+
+        public async Task CommitAsync() => await SaveChangesAsync();
+
+        public void Dispose()
+        {
+            base.Dispose();
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\UnitOfWork\Repositories\BaseReadRepository.cs
+
+using Microsoft.EntityFrameworkCore;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace UnitOfWork.Repositories
+{
+    public class BaseReadRepository<TEntity> : IReadRepository<TEntity> where TEntity : BaseEntity
+    {
+        protected readonly DbSet<TEntity> _dbSet;
+
+        public BaseReadRepository(DbSet<TEntity> dbSet)
+        {
+            _dbSet = dbSet;
+        }
+
+        public IQueryable<TEntity> AsQueryable()
+        {
+
+            return _dbSet.Where(e => !e.IsDeleted).AsNoTracking();
+        }
+
+        public async Task<TEntity?> GetByIdAsync(Guid id)
+        {
+            return await _dbSet.FirstOrDefaultAsync(e => e.Id == id && !e.IsDeleted);
+        }
+
+        public async Task<IEnumerable<TEntity>> GetAllAsync()
+        {
+            return await _dbSet.Where(e => !e.IsDeleted).ToListAsync();
+        }
+
+        public async Task<IEnumerable<TEntity>> FindAsync(Expression<Func<TEntity, bool>> predicate)
+        {
+            return await _dbSet.Where(e => !e.IsDeleted).Where(predicate).ToListAsync();
+        }
+
+        public void Detach(TEntity entity)
+        {
+            var entry = _dbSet.Entry(entity);
+            if (entry != null)
+            {
+                entry.State = EntityState.Detached;
+            }
+        }
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\UnitOfWork\Repositories\BaseWriteRepository.cs
+
+using Microsoft.EntityFrameworkCore;
+using SharedDomain.Common;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace UnitOfWork.Repositories
+{
+    public class BaseWriteRepository<TEntity> : IWriteRepository<TEntity> where TEntity : BaseEntity
+    {
+        protected readonly DbSet<TEntity> _dbSet;
+        private readonly IUnitOfWork _unitOfWork;
+
+        public BaseWriteRepository(DbSet<TEntity> dbSet, IUnitOfWork unitOfWork)
+        {
+            _dbSet = dbSet;
+            _unitOfWork = unitOfWork;
+        }
+
+        public IUnitOfWork UnitOfWork => _unitOfWork;
+
+        public async Task<TEntity> AddAsync(TEntity entity)
+        {
+            await _dbSet.AddAsync(entity);
+            return entity;
+        }
+
+        public async Task AddRangeAsync(IEnumerable<TEntity> entities)
+        {
+            await _dbSet.AddRangeAsync(entities);
+        }
+
+        public void Update(TEntity entity)
+        {
+            _dbSet.Update(entity);
+        }
+
+        public void Remove(TEntity entity)
+        {
+
+            entity.IsDeleted = true;
+            _dbSet.Update(entity);
+        }
+
+        public void RemoveRange(IEnumerable<TEntity> entities)
+        {
+
+            foreach (var entity in entities)
+            {
+                entity.IsDeleted = true;
+                _dbSet.Update(entity);
+            }
+        }
+
+        public void Attach(TEntity entity) => _dbSet.Attach(entity);
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\UnitOfWork\Repositories\IReadRepository.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace UnitOfWork.Repositories
+{    
+    public interface IReadRepository<TEntity> where TEntity : class
+    {
+        IQueryable<TEntity> AsQueryable();
+        Task<TEntity?> GetByIdAsync(Guid id);
+        Task<IEnumerable<TEntity>> GetAllAsync();
+        Task<IEnumerable<TEntity>> FindAsync(Expression<Func<TEntity, bool>> predicate);
+
+        void Detach(TEntity entity);
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
+// File: C:\Users\ssala\Documents\TripleGates\Core.identity\UnitOfWork\Repositories\IWriteRepository.cs
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace UnitOfWork.Repositories
+{
+    public interface IWriteRepository<TEntity> where TEntity : class
+    {
+        IUnitOfWork UnitOfWork { get; }
+
+        Task<TEntity> AddAsync(TEntity entity);
+        Task AddRangeAsync(IEnumerable<TEntity> entities);
+        void Update(TEntity entity);
+        void Remove(TEntity entity);
+        void RemoveRange(IEnumerable<TEntity> entities);
+
+        void Attach(TEntity entity);
+    }
+}
+
+
+--------------------------------------------------------------------------------
+
